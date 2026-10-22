@@ -1,0 +1,13 @@
+{
+  "nautilus": "1.231.0",
+  "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+  "compiler": "ziglang 0.13.0 x86_64-windows-gnu",
+  "cython": "3.1.2",
+  "sha256": {
+    "split_native.pyx": "f694b0176f7417a3ba63bbebf3aac997e5d87e1c2e4e2e53d2811c0bb93a0d50",
+    "split_native.c": "34bd0a48e05853bb0ae16b9013066bd5d476b40bde9a48a3c97d9b2f0be23f15",
+    "split_native.cp312-win_amd64.pyd": "d6525c469af7f157c813ceaced97ba100b3754a64a65cd3d534613936c91a24c",
+    "position.pxd": "1df33dcd00d14a21733f781aa2ea56d0aaa24af80bcdbf245f3b745035f2d87c",
+    "position.cp312-win_amd64.pyd": "1de88ebb2a9d7ecfa47a80d2dbbb0c7ba899df04cdb2938baa8168ee356cc7cc"
+  }
+}
