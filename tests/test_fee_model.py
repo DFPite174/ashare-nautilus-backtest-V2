@@ -118,3 +118,94 @@ def test_historical_fee_rates_and_oracle():
     # 新印花税: 佣金 30 + 过户费 1 + 印花税 50 = 81.00
     fee_new = calculate_expected_fee("SELL", Decimal("1000"), Decimal("100"), trade_date="2024-01-01")
     assert fee_new == Decimal("81.00")
+
+
+def test_fee_oracle_partial_fills_accuracy():
+    """
+    【N10 费用 Oracle 部分成交核验】
+    验证独立费用 Oracle calculate_expected_fee 准确支持母订单多次部分成交的增量佣金核算，
+    与 AShareFeeModel 原生行为严格一致。
+    """
+    from engine.fee_model import calculate_expected_fee
+
+    # 母订单分两笔各 50 股 @ 10.0 元 (总计 1000 元)
+    # 第一笔: 成交 500 元，佣金保底 5 元 + 过户费 0.005 元 -> 5.01 元
+    fee_1 = calculate_expected_fee(
+        side="BUY",
+        qty=Decimal("50"),
+        price=Decimal("10.0"),
+        is_new_order=True,
+        cum_trade_val_before=Decimal("0.0"),
+    )
+    assert fee_1 == Decimal("5.01")
+
+    # 第二笔: 增量 500 元，累计 1000 元未超 5 元保底，增量佣金为 0，仅收过户费 0.005 -> 0.01 元
+    fee_2 = calculate_expected_fee(
+        side="BUY",
+        qty=Decimal("50"),
+        price=Decimal("10.0"),
+        is_new_order=False,
+        cum_trade_val_before=Decimal("500.0"),
+    )
+    assert fee_2 == Decimal("0.01")
+    assert fee_1 + fee_2 == Decimal("5.02")
+
+    # 第三笔: 增量 20,000 元 (累计 21,000 元，超过保底阈值)
+    # 应纳佣金从 5.0 增加至 21000 * 0.0003 = 6.30 元 (增量佣金 1.30 元)
+    # 过户费 20000 * 0.00001 = 0.20 元 -> 总计 1.50 元
+    fee_3 = calculate_expected_fee(
+        side="BUY",
+        qty=Decimal("2000"),
+        price=Decimal("10.0"),
+        is_new_order=False,
+        cum_trade_val_before=Decimal("1000.0"),
+    )
+    assert fee_3 == Decimal("1.50")
+
+
+def test_native_fee_model_automatic_historical_date():
+    """
+    【N05 原生收费路径自动历史费率匹配】
+    验证 AShareFeeModel 自动从订单纳秒时戳 (order.ts_init) 解析历史交易日，
+    原生计算 2023-08-28 调整前的 1‰ 印花税 (131.00 元) 与调整后的 0.5‰ 印花税 (81.00 元)。
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    shanghai_tz = ZoneInfo("Asia/Shanghai")
+
+    model = AShareFeeModel()
+
+    # 1. 2023-08-25 卖出 1000 股 @ 100 元 (调整前，印花税千分之 1)
+    ts_2023 = int(datetime(2023, 8, 25, 14, 0, 0, tzinfo=shanghai_tz).timestamp() * 1e9)
+    inst_id = InstrumentId(Symbol("600519_SH"), Venue("SSE"))
+    order_old = MarketOrder(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("STRATEGY-001"),
+        instrument_id=inst_id,
+        client_order_id=ClientOrderId("HIST-1"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(1000),
+        time_in_force=TimeInForce.GTC,
+        init_id=UUID4(),
+        ts_init=ts_2023,
+    )
+    fee_old = model.get_fee(order_old, Price.from_str("100.0"), Quantity.from_int(1000))
+    # 佣金 30 + 过户费 1 + 印花税 100 = 131.00 元
+    assert fee_old.as_double() == 131.00
+
+    # 2. 2024-01-05 卖出 1000 股 @ 100 元 (调整后，印花税万分之 5)
+    ts_2024 = int(datetime(2024, 1, 5, 14, 0, 0, tzinfo=shanghai_tz).timestamp() * 1e9)
+    order_new = MarketOrder(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("STRATEGY-001"),
+        instrument_id=inst_id,
+        client_order_id=ClientOrderId("HIST-2"),
+        order_side=OrderSide.SELL,
+        quantity=Quantity.from_int(1000),
+        time_in_force=TimeInForce.GTC,
+        init_id=UUID4(),
+        ts_init=ts_2024,
+    )
+    fee_new = model.get_fee(order_new, Price.from_str("100.0"), Quantity.from_int(1000))
+    # 佣金 30 + 过户费 1 + 印花税 50 = 81.00 元
+    assert fee_new.as_double() == 81.00

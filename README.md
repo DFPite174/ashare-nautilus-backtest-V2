@@ -6,7 +6,7 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![NautilusTrader 1.231.0](https://img.shields.io/badge/NautilusTrader-1.231.0-brightgreen.svg)](https://nautilustrader.io/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-33%20passed-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-43%20passed-brightgreen.svg)]()
 
 ---
 
@@ -79,7 +79,7 @@ ashare-nautilus-backtest-V2/
 │   ├── split_guard.py       # 拆股扩展加载守卫
 │   ├── split_native.pyx     # Cython 原生拆股扩展源码
 │   └── split_native.cp312-win_amd64.pyd # Windows cp312 二进制构建
-├── tests/                   # 自动化测试套件 (33 项测试全量通过)
+├── tests/                   # 自动化测试套件 (43 项测试全量通过)
 │   ├── test_contracts.py                 # 研究契约深不可变与边界校验测试
 │   ├── test_fee_model.py                 # 订单级费用累计、缓存隔离与 Oracle 测试
 │   ├── test_golden_ledger.py             # 黄金账本幂等性、单调时序与公司行为测试
@@ -109,7 +109,7 @@ pytest tests/ -v
 
 **运行结果**：
 ```text
-======================= 33 passed, 6 warnings in 1.85s ========================
+======================= 43 passed, 8 warnings in 1.39s ========================
 ```
 
 ---

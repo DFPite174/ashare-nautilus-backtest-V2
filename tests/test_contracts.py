@@ -94,3 +94,40 @@ def test_execution_assumptions_defaults():
     assert assump.min_commission == Decimal("5.0")
     assert assump.t_plus_one is True
     assert assump.stamp_duty_rate == Decimal("0.0005")
+
+
+def test_target_weights_serialization_and_deep_copy():
+    """
+    【N11 契约序列化与深复制回归检验】
+    验证深冻结 TargetWeights 支持 Pydantic model_dump_json()、model_copy(deep=True)、
+    以及 pickle 跨进程序列化，同时保持严格不可变性。
+    """
+    import pickle
+    import json
+
+    tw = TargetWeights(
+        signal_date=date(2025, 5, 5),
+        execution_date=date(2025, 5, 6),
+        weights={"600519.SH": 0.6, "000001.SZ": 0.4},
+        strategy_id="stat_arb_01",
+    )
+
+    # 1. Pydantic model_dump_json() 必须成功并能反序列化
+    json_str = tw.model_dump_json()
+    assert isinstance(json_str, str)
+    data = json.loads(json_str)
+    assert data["weights"]["600519.SH"] == 0.6
+    assert data["weights"]["000001.SZ"] == 0.4
+
+    # 2. model_copy(deep=True) 必须成功且拷贝对象同样保持不可变
+    tw_copied = tw.model_copy(deep=True)
+    assert tw_copied.weights["600519.SH"] == 0.6
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        tw_copied.weights["600519.SH"] = 0.9  # type: ignore
+
+    # 3. pickle 序列化与跨进程传输能力
+    pickled_bytes = pickle.dumps(tw)
+    tw_unpickled = pickle.loads(pickled_bytes)
+    assert tw_unpickled.weights == tw.weights
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        tw_unpickled.weights["000001.SZ"] = 0.1  # type: ignore

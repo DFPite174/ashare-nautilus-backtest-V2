@@ -4,12 +4,55 @@
 """
 
 from __future__ import annotations
+from collections.abc import Mapping
+import copy
+import math
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field, ConfigDict, model_validator
-from types import MappingProxyType
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_serializer
+
+
+class FrozenDict(Mapping):
+    """不可变字典包装类，支持哈希、Pickle序列化、深拷贝与 Pydantic 导出 (N11)"""
+    def __init__(self, data: Mapping | dict):
+        self._data = dict(data)
+        self._hash = None
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __setitem__(self, key, value):
+        raise TypeError("FrozenDict is immutable and cannot be modified")
+
+    def __delitem__(self, key):
+        raise TypeError("FrozenDict is immutable and cannot be modified")
+
+    def __repr__(self):
+        return repr(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, Mapping):
+            return self._data == dict(other)
+        return False
+
+    def __hash__(self):
+        if self._hash is None:
+            self._hash = hash(frozenset(self._data.items()))
+        return self._hash
+
+    def __reduce__(self):
+        return (FrozenDict, (self._data,))
+
+    def __deepcopy__(self, memo):
+        return FrozenDict(copy.deepcopy(self._data, memo))
 
 
 class AssetClass(str, Enum):
@@ -106,9 +149,12 @@ class TargetWeights(BaseModel):
     strategy_id: str = Field(default="default_strategy")
     params_hash: str = Field(default="")
 
+    @field_serializer("weights", mode="plain")
+    def serialize_weights(self, v) -> dict[str, float]:
+        return dict(v)
+
     @model_validator(mode="after")
     def validate_target_weights(self) -> "TargetWeights":
-        import math
         if self.execution_date < self.signal_date:
             raise ValueError(f"execution_date ({self.execution_date}) cannot precede signal_date ({self.signal_date})")
         for sym, w in self.weights.items():
@@ -119,8 +165,8 @@ class TargetWeights(BaseModel):
         total_w = sum(self.weights.values())
         if total_w > 1.000001:
             raise ValueError(f"Total target weights sum to {total_w:.4f}, exceeding 1.0 limit")
-        # 深冻结字典，防止通过内层字典直接篡改数据 (R06)
-        object.__setattr__(self, "weights", MappingProxyType(dict(self.weights)))
+        # 深冻结字典，防止通过内层字典直接篡改数据，同时支持 JSON 与深复制 (N11)
+        object.__setattr__(self, "weights", FrozenDict(self.weights))
         return self
 
 
@@ -155,6 +201,7 @@ class DailyNAV(BaseModel):
     cash: Decimal
     positions_value: Decimal
     total_equity: Decimal
+    receivable_dividends: Decimal = Field(default=Decimal("0.0"), description="应收现金红利 (除息后、到账前)")
     holdings: Dict[str, Decimal] = Field(default_factory=dict, description="标的持仓股数")
     tradable_holdings: Dict[str, Decimal] = Field(default_factory=dict, description="T+1 可卖股数")
 

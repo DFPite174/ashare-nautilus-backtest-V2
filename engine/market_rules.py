@@ -218,24 +218,35 @@ def block_reason(
     if limit_state == "UNAVAILABLE":
         return "PRICE_BAND_UNAVAILABLE"
 
+    if not isinstance(bar, dict):
+        return "INVALID_BAR_DATA"
+
+    vol = bar.get("volume")
+    if vol is None or not isinstance(vol, (int, float)) or not math.isfinite(vol):
+        return "INVALID_BAR_DATA"
+
     if limit_state == "UNBOUNDED":
-        if bar.get("volume", 0) <= 0:
+        if vol <= 0:
             return "ZERO_VOLUME"
         return None
 
     if limit_state == "BOUNDED":
-        if bar.get("volume", 0) <= 0:
+        if vol <= 0:
             return "ZERO_VOLUME"
         lo, hi = rule.get("down_limit"), rule.get("up_limit")
         if lo is None or hi is None or lo <= 0 or hi <= lo:
             return "PRICE_BAND_UNAVAILABLE"
-        close_p = bar.get("close", 0.0)
+        close_p = bar.get("close")
+        if close_p is None or not isinstance(close_p, (int, float)) or not math.isfinite(close_p) or close_p <= 0:
+            return "INVALID_BAR_DATA"
         # 日线收盘执行：保守策略在涨停日拒绝买单，跌停日拒绝卖单
         if side.lower() == "buy" and close_p >= hi - 1e-8:
             return "LIMIT_UP_CLOSE"
         if side.lower() == "sell" and close_p <= lo + 1e-8:
             return "LIMIT_DOWN_CLOSE"
         if execution_price is not None:
+            if not isinstance(execution_price, (int, float)) or not math.isfinite(execution_price):
+                return "INVALID_EXECUTION_PRICE"
             if not (lo - 1e-8 <= float(execution_price) <= hi + 1e-8):
                 return "PRICE_OUTSIDE_BAND"
 

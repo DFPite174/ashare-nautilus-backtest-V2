@@ -6,7 +6,8 @@ A 股独立参考黄金账本 (Golden Ledger)
 """
 
 from __future__ import annotations
-from decimal import Decimal
+from datetime import date
+from decimal import Decimal, ROUND_FLOOR
 from typing import Dict, List, Any, Set, Optional, Tuple
 from contracts import DailyNAV, Fill, OrderSide, CorporateAction
 
@@ -32,21 +33,38 @@ class GoldenLedger:
         self.latest_prices: Dict[str, Tuple[Decimal, str]] = {} # sym -> (price, asof_date)
         self.last_valuation_date: Optional[str] = None
 
-        # 公司行为追踪 (R09: 登记日权益快照与支付日兑付分离)
+        # 公司行为会计链 (N06, N07, N08, N09)
         self.pending_corporate_actions: List[CorporateAction] = []
-        self.dividend_entitlements: Dict[str, Decimal] = {} # action_key -> entitled_shares
+        self.dividend_entitlements: Dict[str, Decimal] = {}      # action_key -> entitled_shares
+        self.receivable_dividends: Dict[str, Decimal] = {}       # action_key -> receivable_cash (应收分红)
+        self.pending_listing_shares: List[Tuple[date, str, Decimal]] = [] # [(listing_date, symbol, qty)]
         self.processed_action_ids: Set[str] = set()
 
     def on_trade_day_start(self, trade_date: str) -> None:
         """
-        交易日开始：推进 T+1 时钟，将之前买入的股份转为可卖状态
+        交易日开始：推进 T+1 时钟，将之前买入的股份转为可卖状态，并解冻满足上市日的新增送转股份 (N06)
         """
+        cur_d = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
+
+        # 1. 推进常规 T+1 买入股份结转
         for sym, lot_list in self.lots.items():
             tradable_qty = Decimal("0.0")
             for lot_date, qty in lot_list:
                 if lot_date < trade_date:
                     tradable_qty += qty
             self.tradable_positions[sym] = tradable_qty
+
+        # 2. 检查新增股份上市日 (share_listing_date)，解冻送转股份 (N06)
+        remaining_listings: List[Tuple[date, str, Decimal]] = []
+        for list_d, sym, qty in self.pending_listing_shares:
+            if cur_d >= list_d:
+                self.tradable_positions[sym] = self.tradable_positions.get(sym, Decimal("0")) + qty
+                if sym not in self.lots:
+                    self.lots[sym] = []
+                self.lots[sym].append((str(list_d), qty))
+            else:
+                remaining_listings.append((list_d, sym, qty))
+        self.pending_listing_shares = remaining_listings
 
     def apply_fill(self, fill: Fill, trade_date: str) -> None:
         """
@@ -121,25 +139,53 @@ class GoldenLedger:
             return total_div
         return Decimal("0.0")
 
-    def apply_stock_split(self, symbol: str, split_ratio: Decimal, trade_date: str) -> None:
+    def apply_stock_split(
+        self,
+        symbol: str,
+        split_ratio: Decimal,
+        trade_date: str,
+        share_listing_date: Optional[date] = None,
+    ) -> None:
         """
-        【R09】处理股票拆细 / 送转股：
-        保持持仓总市值不变，按 split_ratio 等比调整持仓数量与各批次历史 shares
+        【N06 & N09】处理股票拆细 / 送转股：
+        保持持仓总市值不变，按整数股向下取整 (ROUND_FLOOR)，保证批次与总持仓严格守恒。
         """
+        split_ratio = Decimal(str(split_ratio))
         if split_ratio <= Decimal("0.0"):
             raise ValueError(f"Split ratio must be positive, got {split_ratio}")
 
-        if symbol in self.positions:
-            self.positions[symbol] = (self.positions[symbol] * split_ratio).quantize(Decimal("1.0"))
+        cur_d = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
+        orig_held = self.positions.get(symbol, Decimal("0.0"))
+        if orig_held <= Decimal("0.0"):
+            return
 
-        if symbol in self.tradable_positions:
-            self.tradable_positions[symbol] = (self.tradable_positions[symbol] * split_ratio).quantize(Decimal("1.0"))
+        new_total_held = (orig_held * split_ratio).to_integral_value(rounding=ROUND_FLOOR)
+        bonus_qty = new_total_held - orig_held
+        self.positions[symbol] = new_total_held
 
-        if symbol in self.lots:
-            self.lots[symbol] = [
-                (d, (q * split_ratio).quantize(Decimal("1.0")))
-                for d, q in self.lots[symbol]
-            ]
+        # 送转新增股份是否可立即交易 (N06)
+        if share_listing_date is None or cur_d >= share_listing_date:
+            self.tradable_positions[symbol] = (
+                self.tradable_positions.get(symbol, Decimal("0.0")) * split_ratio
+            ).to_integral_value(rounding=ROUND_FLOOR)
+            # 立即上市：调整现有全部 lots
+            if symbol in self.lots and self.lots[symbol]:
+                updated_lots: List[Tuple[str, Decimal]] = []
+                allocated = Decimal("0.0")
+                for i, (d, q) in enumerate(self.lots[symbol]):
+                    adjusted_q = (q * split_ratio).to_integral_value(rounding=ROUND_FLOOR)
+                    updated_lots.append((d, adjusted_q))
+                    allocated += adjusted_q
+
+                diff = new_total_held - allocated
+                if diff != Decimal("0.0") and updated_lots:
+                    d0, q0 = updated_lots[0]
+                    updated_lots[0] = (d0, q0 + diff)
+
+                self.lots[symbol] = updated_lots
+        else:
+            # 原持仓保持可卖状态，新产生的股份挂入 pending_listing_shares，待 share_listing_date 上市日才解冻到账 (N06)
+            self.pending_listing_shares.append((share_listing_date, symbol, bonus_qty))
 
     def register_corporate_action(self, action: CorporateAction) -> None:
         """
@@ -149,48 +195,82 @@ class GoldenLedger:
 
     def process_corporate_actions_for_date(self, current_date_str: str) -> None:
         """
-        【R09】按交易日推进并原子执行公司行为会计链：
-        1. 股权登记日 (record_date): 锁定登记日收盘持仓权益 (entitlement snapshot)
-        2. 除权除息日 (ex_date): 执行送转股拆细 (apply_stock_split)
-        3. 派息到账日 (pay_date): 根据登记日锁定的权益派发税前现金红利到账
+        【N06, N07, N08, N09】按交易日推进并原子执行公司行为会计链：
+        1. 股权登记日 (record_date): 锁定登记日收盘持仓权益快照 (entitlement snapshot)
+        2. 除权除息日 (ex_date):
+           - 送转股按整数股执行拆细 (apply_stock_split)，新增股份若有 share_listing_date 则延迟可卖
+           - 现金分红确认应收分红 (receivable_dividends)，确保除息到派现期间净值平滑不虚降 (N07)
+        3. 派息到账日 (pay_date):
+           - 严格从登记日快照计算现金红利，应收分红转为实际现金流入 (N08)
         """
-        from datetime import date
         cur_d = date.fromisoformat(current_date_str) if isinstance(current_date_str, str) else current_date_str
 
         for action in self.pending_corporate_actions:
             act_id = f"{action.symbol}_{action.ex_date}"
 
-            # 1. 登记日快照
+            # 1. 登记日快照 (N08)
             if action.record_date and cur_d == action.record_date:
                 held = self.positions.get(action.symbol, Decimal("0.0"))
                 self.dividend_entitlements[act_id] = held
 
-            # 2. 除权除息日送转股处理
+            # 2. 除权除息日送转股与应收分红处理 (N06, N07)
             if cur_d == action.ex_date:
+                # 确定计算权益所依据的股数
+                if action.record_date:
+                    if act_id not in self.dividend_entitlements:
+                        raise RuntimeError(
+                            f"Missing entitlement snapshot for corporate action {act_id} on record date {action.record_date}"
+                        )
+                    entitled_qty = self.dividend_entitlements[act_id]
+                else:
+                    entitled_qty = self.positions.get(action.symbol, Decimal("0.0"))
+                    self.dividend_entitlements[act_id] = entitled_qty
+
+                # 2.1 送转股拆细
                 total_ratio = Decimal("1.0") + action.bonus_ratio + action.reserve_ratio
                 if total_ratio > Decimal("1.0") and f"{act_id}_split" not in self.processed_action_ids:
-                    self.apply_stock_split(action.symbol, total_ratio, current_date_str)
+                    self.apply_stock_split(
+                        action.symbol,
+                        total_ratio,
+                        current_date_str,
+                        share_listing_date=action.share_listing_date,
+                    )
                     self.processed_action_ids.add(f"{act_id}_split")
 
-            # 3. 派息日现金到账
+                # 2.2 确认应收分红 (N07: 确保除息日价格下跌时，应收分红维持净值守恒)
+                if action.cash_div > Decimal("0.0") and f"{act_id}_receivable" not in self.processed_action_ids:
+                    receivable_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"))
+                    self.receivable_dividends[act_id] = receivable_cash
+                    self.processed_action_ids.add(f"{act_id}_receivable")
+
+            # 3. 派息日现金红利到账兑付 (N07, N08)
             pay_d = action.pay_date or action.ex_date
             if cur_d == pay_d and action.cash_div > Decimal("0.0"):
-                if f"{act_id}_cash" not in self.processed_action_ids:
-                    # 优先取登记日锁定的持仓，若无登记日则取除息日持仓
-                    entitled_qty = self.dividend_entitlements.get(
-                        act_id, self.positions.get(action.symbol, Decimal("0.0"))
-                    )
-                    div_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"))
+                if f"{act_id}_paid" not in self.processed_action_ids:
+                    # 优先冲减应收分红转换为实际到账现金
+                    if act_id in self.receivable_dividends:
+                        div_cash = self.receivable_dividends.pop(act_id)
+                    else:
+                        if action.record_date and act_id not in self.dividend_entitlements:
+                            raise RuntimeError(
+                                f"Missing entitlement snapshot for corporate action {act_id} on record date {action.record_date}"
+                            )
+                        entitled_qty = self.dividend_entitlements.get(
+                            act_id, self.positions.get(action.symbol, Decimal("0.0"))
+                        )
+                        div_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"))
+
                     self.cash += div_cash
-                    self.processed_action_ids.add(f"{act_id}_cash")
+                    self.processed_action_ids.add(f"{act_id}_paid")
 
     def mark_to_market(self, trade_date: Any, close_prices: Dict[str, Decimal]) -> DailyNAV:
         """
-        【R05 & R08】按每日收盘价盯市估值并生成每日资产净值 (NAV) 记录。
-        具备单调时间序列保护：
+        【R05, R08, N07】按每日收盘价盯市估值并生成每日资产净值 (NAV) 记录。
+        具备单调时间序列保护与应收分红权益守恒：
         1. 严禁时序回退 (trade_date 必须单调递增或等同)。
         2. 报价缓存记录归属时间 (asof_date)，严禁将未来日期的价格用于历史估值。
-        3. 若当前持仓完全缺失历史报价，显式抛出 KeyError，严禁静默假定 0 价值。
+        3. 若当前持仓完全缺失历史报价，显式抛出 KeyError。
+        4. NAV 包含现金 + 持仓股票公允市值 + 应收现金红利 (N07 权益守恒)。
         """
         trade_date_str = str(trade_date)[:10]
 
@@ -223,12 +303,16 @@ class GoldenLedger:
                     raise KeyError(f"Missing valuation price as-of {trade_date_str} for position {sym}")
                 pos_val += qty * px
 
-        total_equity = self.cash + pos_val
+        # 4. 计算当前应收分红 (N07)
+        total_receivable = sum(self.receivable_dividends.values(), Decimal("0.0"))
+        total_equity = self.cash + pos_val + total_receivable
+
         nav = DailyNAV(
             date=trade_date_str,
             cash=self.cash,
             positions_value=pos_val,
             total_equity=total_equity,
+            receivable_dividends=total_receivable,
             holdings=dict(self.positions),
             tradable_holdings=dict(self.tradable_positions),
         )
