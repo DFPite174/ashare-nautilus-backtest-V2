@@ -110,11 +110,11 @@ class GoldenLedger:
             self.positions[fill.symbol] -= fill.quantity
             self.tradable_positions[fill.symbol] -= fill.quantity
 
-            # 扣减 lots (FIFO 优先扣除最早股份)
+            # 扣减 lots (FIFO 优先扣除最早股份，Q02 消除幽灵批次与负持仓)
             rem = fill.quantity
             new_lots = []
             for lot_date, q in self.lots.get(fill.symbol, []):
-                if lot_date < trade_date and rem > 0:
+                if rem > 0:
                     if q <= rem:
                         rem -= q
                     else:
@@ -122,7 +122,29 @@ class GoldenLedger:
                         rem = Decimal("0.0")
                 else:
                     new_lots.append((lot_date, q))
-            self.lots[fill.symbol] = new_lots
+
+            if rem > Decimal("0.0"):
+                raise RuntimeError(
+                    f"Fatal lot inconsistency: failed to deduct {rem} shares from lots for {fill.symbol}"
+                )
+
+            # 持仓归零清理与批次强守恒校验 (Q02)
+            if self.positions[fill.symbol] == Decimal("0.0"):
+                self.lots[fill.symbol] = []
+                self.tradable_positions[fill.symbol] = Decimal("0.0")
+            else:
+                self.lots[fill.symbol] = new_lots
+
+            # 强守恒校验：已上市批次 + 待上市批次 严格恒等于 总持仓
+            pending_bonus = sum(
+                (q for ld, s, q in self.pending_listing_shares if s == fill.symbol),
+                Decimal("0.0"),
+            )
+            lot_sum = sum((q for _, q in self.lots.get(fill.symbol, [])), Decimal("0.0"))
+            if lot_sum + pending_bonus != self.positions[fill.symbol]:
+                raise RuntimeError(
+                    f"Lot conservation violated for {fill.symbol}: lots sum {lot_sum} + pending {pending_bonus} != position {self.positions[fill.symbol]}"
+                )
 
         # 4. 全部修改成功后，记录成交历史与去重标记
         self.fills.append(fill)
@@ -145,10 +167,14 @@ class GoldenLedger:
         split_ratio: Decimal,
         trade_date: str,
         share_listing_date: Optional[date] = None,
+        fractional_policy: str = "floor",
     ) -> None:
         """
-        【N06 & N09】处理股票拆细 / 送转股：
-        保持持仓总市值不变，按整数股向下取整 (ROUND_FLOOR)，保证批次与总持仓严格守恒。
+        【N06, N09, Q07】处理股票拆细 / 送转股：
+        保持持仓总市值不变，支持可配置的零碎股处理策略 (fractional_policy):
+        - 'floor': 向下取整保留整数股 (ROUND_FLOOR，默认)，保证批次与总持仓严格守恒。
+        - 'reject': 若存在零碎股则严格拒绝并抛出异常。
+        - 'cash_in_lieu': 零碎部分按当前估值价格折算为现金补足入账。
         """
         split_ratio = Decimal(str(split_ratio))
         if split_ratio <= Decimal("0.0"):
@@ -159,7 +185,24 @@ class GoldenLedger:
         if orig_held <= Decimal("0.0"):
             return
 
-        new_total_held = (orig_held * split_ratio).to_integral_value(rounding=ROUND_FLOOR)
+        raw_new_held = orig_held * split_ratio
+        floored_held = raw_new_held.to_integral_value(rounding=ROUND_FLOOR)
+        frac = raw_new_held - floored_held
+
+        if fractional_policy == "reject" and frac > Decimal("0.0"):
+            raise ValueError(
+                f"Fractional share detected under reject policy for {symbol}: held {orig_held} * ratio {split_ratio} = {raw_new_held}"
+            )
+        elif fractional_policy == "cash_in_lieu" and frac > Decimal("0.0"):
+            px = Decimal("1.0")
+            if symbol in self.latest_prices:
+                px = self.latest_prices[symbol][0]
+            cash_comp = (frac * px).quantize(Decimal("0.01"))
+            self.cash += cash_comp
+            new_total_held = floored_held
+        else:
+            new_total_held = floored_held
+
         bonus_qty = new_total_held - orig_held
         self.positions[symbol] = new_total_held
 
@@ -234,6 +277,7 @@ class GoldenLedger:
                         total_ratio,
                         current_date_str,
                         share_listing_date=action.share_listing_date,
+                        fractional_policy=action.fractional_policy,
                     )
                     self.processed_action_ids.add(f"{act_id}_split")
 

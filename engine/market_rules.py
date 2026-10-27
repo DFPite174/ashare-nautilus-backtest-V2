@@ -234,7 +234,16 @@ def block_reason(
         if vol <= 0:
             return "ZERO_VOLUME"
         lo, hi = rule.get("down_limit"), rule.get("up_limit")
-        if lo is None or hi is None or lo <= 0 or hi <= lo:
+        if (
+            lo is None
+            or hi is None
+            or not isinstance(lo, (int, float))
+            or not isinstance(hi, (int, float))
+            or not math.isfinite(lo)
+            or not math.isfinite(hi)
+            or lo <= 0
+            or hi <= lo
+        ):
             return "PRICE_BAND_UNAVAILABLE"
         close_p = bar.get("close")
         if close_p is None or not isinstance(close_p, (int, float)) or not math.isfinite(close_p) or close_p <= 0:

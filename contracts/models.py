@@ -123,6 +123,10 @@ class CorporateAction(BaseModel):
     bonus_ratio: Decimal = Field(default=Decimal("0.0"), description="每股送股比例 (股)")
     reserve_ratio: Decimal = Field(default=Decimal("0.0"), description="每股转增比例 (股)")
     share_listing_date: Optional[date] = Field(default=None, description="新增股份可交易上市日")
+    fractional_policy: str = Field(
+        default="floor",
+        description="公司行为零碎股处理策略: 'floor' (向下取整，默认), 'reject' (存在零碎股时抛出异常), 'cash_in_lieu' (零碎部分现金折现)",
+    )
 
 
 class ExecutionAssumptions(BaseModel):

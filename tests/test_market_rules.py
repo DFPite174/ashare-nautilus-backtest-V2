@@ -74,3 +74,33 @@ def test_block_reason_limit_up_down_and_suspension():
         "limit_state": "UNAVAILABLE",
     }
     assert block_reason(suspended_rule, bar_limit_up, "buy") == "SUSPENDED"
+
+
+def test_block_reason_nan_and_invalid_limit_prices():
+    """
+    【Q04 验证】涨跌停价格包含 NaN、非有限数值或异常区间时，
+    无论市价单还是限价单，block_reason 均必须严格返回 PRICE_BAND_UNAVAILABLE 阻断。
+    """
+    nan_rule = {
+        "trade_status": "OPEN",
+        "limit_state": "BOUNDED",
+        "up_limit": float("nan"),
+        "down_limit": float("nan"),
+    }
+    bar = {"close": 10.00, "volume": 10000}
+
+    # 市价单 (无 execution_price) 必须阻断
+    assert block_reason(nan_rule, bar, "buy") == "PRICE_BAND_UNAVAILABLE"
+    assert block_reason(nan_rule, bar, "sell") == "PRICE_BAND_UNAVAILABLE"
+
+    # 限价单也必须阻断
+    assert block_reason(nan_rule, bar, "buy", execution_price=10.00) == "PRICE_BAND_UNAVAILABLE"
+
+    # down_limit >= up_limit 异常区间必须阻断
+    inverted_rule = {
+        "trade_status": "OPEN",
+        "limit_state": "BOUNDED",
+        "up_limit": 9.00,
+        "down_limit": 11.00,
+    }
+    assert block_reason(inverted_rule, bar, "buy") == "PRICE_BAND_UNAVAILABLE"

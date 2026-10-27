@@ -8,21 +8,36 @@
 """
 
 import pytest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
+from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import CNY
-from nautilus_trader.model.enums import OrderSide, PositionSide
-from nautilus_trader.model.identifiers import InstrumentId, PositionId, Symbol, Venue
+from nautilus_trader.model.data import Bar, BarSpecification, BarType
+from nautilus_trader.model.enums import (
+    AccountType,
+    AggregationSource,
+    BarAggregation,
+    OmsType,
+    OrderSide,
+    PositionSide,
+    PriceType,
+    TimeInForce,
+)
+from nautilus_trader.model.identifiers import InstrumentId, PositionId, Symbol, Venue, TraderId
 from nautilus_trader.model.instruments import Equity
-from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.model.position import Position
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
+from nautilus_trader.trading.strategy import Strategy, StrategyConfig
 
 from engine.split_guard import load_bridge
 from engine.golden_ledger import GoldenLedger
+from engine.order_gateway import AShareOrderGateway
 from contracts import CorporateAction, Fill, OrderSide as ContractOrderSide
 
 
@@ -207,3 +222,217 @@ def test_corporate_action_integer_quantization_and_lot_conservation():
     # 批次总和与总持仓严格一致
     sum_lots = sum(q for _, q in ledger.lots["600519"])
     assert sum_lots == ledger.positions["600519"]
+
+
+def test_corporate_action_bonus_shares_listing_fifo_sell_no_ghost_inventory():
+    """
+    【Q02 验证】新增股份上市日卖出全部持仓后，FIFO 必须彻底清除所有批次，
+    次日绝不产生幽灵可用持仓，杜绝二次卖出导致持仓变为负数。
+    """
+    ledger = GoldenLedger(initial_cash=Decimal("500000.0"))
+    ledger.on_trade_day_start("2025-05-06")
+
+    # 买入 100 股
+    fill = Fill(
+        fill_id="f-ca-q02-1",
+        symbol="600519",
+        side=ContractOrderSide.BUY,
+        quantity=Decimal("100.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("5.0"),
+        timestamp=datetime(2025, 5, 6, 9, 30, 0),
+    )
+    ledger.apply_fill(fill, "2025-05-06")
+
+    # 注册 10 送 10，除权日 2025-05-08，新增股份上市日为 2025-05-12
+    ca = CorporateAction(
+        symbol="600519",
+        record_date=date(2025, 5, 7),
+        ex_date=date(2025, 5, 8),
+        pay_date=date(2025, 5, 12),
+        bonus_ratio=Decimal("1.0"),
+        share_listing_date=date(2025, 5, 12),
+    )
+    ledger.register_corporate_action(ca)
+
+    # 推进至 2025-05-07 登记日
+    ledger.on_trade_day_start("2025-05-07")
+    ledger.process_corporate_actions_for_date("2025-05-07")
+
+    # 推进至 2025-05-08 除权日：总持仓 200，可卖 100
+    ledger.on_trade_day_start("2025-05-08")
+    ledger.process_corporate_actions_for_date("2025-05-08")
+
+    # 推进至 2025-05-12 上市日：送转股份解冻，总持仓 200，可卖 200
+    ledger.on_trade_day_start("2025-05-12")
+    ledger.process_corporate_actions_for_date("2025-05-12")
+    assert ledger.positions["600519"] == Decimal("200.0")
+    assert ledger.tradable_positions["600519"] == Decimal("200.0")
+
+    # 在 2025-05-12 当天全额卖出 200 股
+    sell_fill = Fill(
+        fill_id="f-ca-q02-sell",
+        symbol="600519",
+        side=ContractOrderSide.SELL,
+        quantity=Decimal("200.0"),
+        price=Decimal("50.0"),
+        fee=Decimal("10.0"),
+        timestamp=datetime(2025, 5, 12, 14, 0, 0),
+    )
+    ledger.apply_fill(sell_fill, "2025-05-12")
+
+    # 关键断言：持仓归零，批次清空
+    assert ledger.positions["600519"] == Decimal("0.0")
+    assert ledger.tradable_positions["600519"] == Decimal("0.0")
+    assert ledger.lots["600519"] == []
+
+    # 推进至次日 2025-05-13：杜绝产生幽灵库存！
+    ledger.on_trade_day_start("2025-05-13")
+    assert ledger.tradable_positions.get("600519", Decimal("0.0")) == Decimal("0.0")
+    assert ledger.positions.get("600519", Decimal("0.0")) == Decimal("0.0")
+
+    # 尝试再次卖出必抛出 T+1 违规，严禁持仓变为负数
+    sell_fill_2 = Fill(
+        fill_id="f-ca-q02-sell-2",
+        symbol="600519",
+        side=ContractOrderSide.SELL,
+        quantity=Decimal("200.0"),
+        price=Decimal("50.0"),
+        fee=Decimal("10.0"),
+        timestamp=datetime(2025, 5, 13, 9, 30, 0),
+    )
+    with pytest.raises(ValueError, match="Ledger T\\+1 violation"):
+        ledger.apply_fill(sell_fill_2, "2025-05-13")
+
+
+def test_corporate_action_fractional_share_policies():
+    """
+    【Q07 验证】公司行为零碎股处理策略 (floor, reject, cash_in_lieu)
+    """
+    # 1. 默认 floor 策略
+    l_floor = GoldenLedger(initial_cash=Decimal("100000.0"))
+    l_floor.positions["600519"] = Decimal("105.0")
+    l_floor.tradable_positions["600519"] = Decimal("105.0")
+    l_floor.lots["600519"] = [("2025-05-01", Decimal("105.0"))]
+    l_floor.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="floor")
+    # 105 * 1.5 = 157.5 -> 向下取整为 157
+    assert l_floor.positions["600519"] == Decimal("157.0")
+
+    # 2. reject 策略：遇零碎股严格报错
+    l_reject = GoldenLedger(initial_cash=Decimal("100000.0"))
+    l_reject.positions["600519"] = Decimal("105.0")
+    with pytest.raises(ValueError, match="Fractional share detected"):
+        l_reject.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="reject")
+
+    # 3. cash_in_lieu 策略：零碎部分折算现金
+    l_cash = GoldenLedger(initial_cash=Decimal("100000.0"))
+    l_cash.positions["600519"] = Decimal("105.0")
+    l_cash.tradable_positions["600519"] = Decimal("105.0")
+    l_cash.lots["600519"] = [("2025-05-01", Decimal("105.0"))]
+    l_cash.latest_prices["600519"] = (Decimal("10.00"), "2025-05-05")
+    # 0.5 股 * 10.00 元 = 5.00 元现金补足入账，持仓取整为 157
+    l_cash.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="cash_in_lieu")
+    assert l_cash.positions["600519"] == Decimal("157.0")
+    assert l_cash.cash == Decimal("100005.00")
+
+
+def test_corporate_action_e2e_engine_split_and_reconciliation():
+    """
+    【Q08 验证】端到端全链路闭环：
+    BacktestEngine 原生撮合买入 -> 策略与 Position 原生拆股 -> 网关与黄金账本多轨同步 -> 原生撮合卖出全部持仓 -> 双账本零漂移对账
+    """
+    SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+    def b2u(s):
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
+        return int(dt.astimezone(timezone.utc).timestamp() * 1e9)
+
+    class SplitE2EStrategy(Strategy):
+        def __init__(self, c, bt, inst):
+            super().__init__(c)
+            self.bt = bt
+            self.inst = inst
+            self.ledger = GoldenLedger(initial_cash=Decimal("100000.0"))
+            self.gateway = AShareOrderGateway()
+            self.bridge = load_bridge()
+            self.split_applied = False
+            self.ca = CorporateAction(
+                symbol="600519",
+                record_date=date(2025, 5, 6),
+                ex_date=date(2025, 5, 7),
+                bonus_ratio=Decimal("1.0"),
+            )
+            self.ledger.register_corporate_action(self.ca)
+
+        def on_start(self):
+            self.subscribe_bars(self.bt)
+
+        def on_order_filled(self, event):
+            fdate = self.gateway.on_order_filled(event)
+            side = ContractOrderSide.BUY if event.order_side == OrderSide.BUY else ContractOrderSide.SELL
+            fill = Fill(
+                fill_id=str(event.trade_id),
+                symbol="600519",
+                side=side,
+                quantity=Decimal(str(event.last_qty.as_double())),
+                price=Decimal(str(event.last_px.as_double())),
+                fee=Decimal(str(event.commission.as_double())),
+                timestamp=datetime.fromtimestamp(event.ts_event / 1e9, tz=SHANGHAI_TZ),
+            )
+            self.ledger.apply_fill(fill, fdate)
+
+        def on_bar(self, bar: Bar):
+            dt = datetime.fromtimestamp(bar.ts_event / 1e9, tz=SHANGHAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+            rule = {"trade_status": "OPEN", "limit_state": "UNBOUNDED", "buy_min": 100, "buy_step": 100, "sell_min": 100, "sell_step": 100, "max_order": 1000000}
+            bar_dict = {"close": bar.close.as_double(), "volume": 10000.0}
+
+            if d_str == "2025-05-06":
+                self.gateway.on_trade_day_start(d_str)
+                self.ledger.on_trade_day_start(d_str)
+                self.ledger.process_corporate_actions_for_date(d_str)
+                order = self.order_factory.limit(self.inst.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("100.00"), TimeInForce.DAY)
+                assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=100.0).is_valid
+                self.submit_order(order)
+
+            elif d_str == "2025-05-07":
+                if not self.split_applied:
+                    self.gateway.on_trade_day_start(d_str)
+                    self.ledger.on_trade_day_start(d_str)
+                    self.ledger.process_corporate_actions_for_date(d_str)
+                    self.gateway.apply_stock_split("600519", 2.0)
+                    for pos in self.cache.positions_open():
+                        self.bridge.apply_split(pos, 2.0, bar.ts_event, self.inst)
+                    self.split_applied = True
+
+            elif d_str == "2025-05-08":
+                self.gateway.on_trade_day_start(d_str)
+                self.ledger.on_trade_day_start(d_str)
+                order = self.order_factory.limit(self.inst.id, OrderSide.SELL, Quantity.from_int(200), Price.from_str("50.00"), TimeInForce.DAY)
+                assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=50.0).is_valid
+                self.submit_order(order)
+
+    cfg = BacktestEngineConfig(trader_id=TraderId("TRADER-001"), logging=LoggingConfig(log_level="ERROR"))
+    eng = BacktestEngine(config=cfg)
+    v = Venue("SSE")
+    eng.add_venue(venue=v, oms_type=OmsType.NETTING, account_type=AccountType.CASH, base_currency=CNY, starting_balances=[Money(100000.0, CNY)])
+    sym = Symbol("600519")
+    inst_id = InstrumentId(sym, v)
+    t0 = b2u("2025-05-01 09:30:00")
+    inst = Equity(instrument_id=inst_id, raw_symbol=sym, currency=CNY, price_precision=2, price_increment=Price.from_str("0.01"), lot_size=Quantity.from_int(100), ts_event=t0, ts_init=t0)
+    eng.add_instrument(inst)
+    bt = BarType(inst_id, BarSpecification(1, BarAggregation.HOUR, PriceType.LAST), AggregationSource.EXTERNAL)
+    eng.add_data([
+        Bar(bt, Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Quantity.from_int(10000), b2u("2025-05-06 09:30:00"), b2u("2025-05-06 09:30:00")),
+        Bar(bt, Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Quantity.from_int(10000), b2u("2025-05-07 09:30:00"), b2u("2025-05-07 09:30:00")),
+        Bar(bt, Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Quantity.from_int(10000), b2u("2025-05-08 09:30:00"), b2u("2025-05-08 09:30:00")),
+    ])
+    strat = SplitE2EStrategy(StrategyConfig(), bt, inst)
+    eng.add_strategy(strat)
+    eng.run()
+
+    # 原生持仓归零
+    assert float(eng.portfolio.net_position(inst_id)) == 0.0
+    # 黄金账本持仓归零
+    assert strat.ledger.positions["600519"] == Decimal("0.0")
+    assert strat.ledger.tradable_positions["600519"] == Decimal("0.0")
+    assert strat.ledger.lots["600519"] == []

@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 from typing import Dict, List, Optional, Set, Tuple, Any
 from zoneinfo import ZoneInfo
 
@@ -58,6 +58,8 @@ class AShareOrderGateway:
         self._active_orders: Dict[str, Order] = {}
         self._order_reserved_qty: Dict[str, Decimal] = {}
         self._order_symbol: Dict[str, str] = {}
+        self._order_declared_qty: Dict[str, Decimal] = {}
+        self._order_cum_filled_qty: Dict[str, Decimal] = {}
 
         # 成交去重 (N03): trade_id 集合
         self._processed_trade_ids: Set[str] = set()
@@ -96,6 +98,27 @@ class AShareOrderGateway:
                 self._bought_lots[sym] = remaining_lots
             else:
                 self._bought_lots.pop(sym, None)
+
+    def apply_stock_split(self, symbol: str, split_ratio: Decimal | float) -> None:
+        """
+        【Q08】公司行为拆股 / 送转股结算持仓与历史买入批次联动同步
+        """
+        ratio = Decimal(str(split_ratio))
+        if ratio <= Decimal("0.0"):
+            raise ValueError(f"Split ratio must be positive, got {ratio}")
+
+        if symbol in self._settled_shares:
+            self._settled_shares[symbol] = (
+                self._settled_shares[symbol] * ratio
+            ).to_integral_value(rounding=ROUND_FLOOR)
+
+        if symbol in self._bought_lots:
+            updated_lots = []
+            for d, q in self._bought_lots[symbol]:
+                updated_lots.append(
+                    (d, (q * ratio).to_integral_value(rounding=ROUND_FLOOR))
+                )
+            self._bought_lots[symbol] = updated_lots
 
     def get_sellable_qty(self, symbol: str) -> Decimal:
         """
@@ -192,19 +215,36 @@ class AShareOrderGateway:
         if vol is None or not isinstance(vol, (int, float)) or not math.isfinite(vol) or vol < 0:
             return OrderValidationResult(is_valid=False, rejection_reason="INVALID_BAR_VOLUME: Bar volume must be non-negative and finite")
 
-        # 5. 市场规则与停牌/涨跌停阻断校验 (Fail-safe)
+        # 5. 市场规则与停牌/涨跌停阻断校验 (Fail-safe, Q04)
+        limit_state = rule.get("limit_state")
+        if limit_state == "BOUNDED":
+            lo, hi = rule.get("down_limit"), rule.get("up_limit")
+            if (
+                lo is None
+                or hi is None
+                or not isinstance(lo, (int, float))
+                or not isinstance(hi, (int, float))
+                or not math.isfinite(lo)
+                or not math.isfinite(hi)
+                or lo <= 0
+                or hi <= lo
+            ):
+                return OrderValidationResult(
+                    is_valid=False,
+                    rejection_reason="PRICE_BAND_UNAVAILABLE: Bounded limit rules must specify finite positive down_limit and up_limit",
+                )
+
         order_price = order.price.as_double() if hasattr(order, "price") and order.price else None
         reason = block_reason(rule, bar, side_str, execution_price=order_price)
         if reason is not None:
             return OrderValidationResult(is_valid=False, rejection_reason=reason)
 
-        # 6. 2% 价格笼子校验 (N04: 限价单在有涨跌幅限制时，基准价必须提供且有效)
+        # 6. 2% 价格笼子校验 (N04 & Q03: 限价单在 BOUNDED 或 UNBOUNDED 交易状态下，均须执行价格笼子校验)
         if order_price is not None:
             if not math.isfinite(order_price) or order_price <= 0:
                 return OrderValidationResult(is_valid=False, rejection_reason="INVALID_ORDER_PRICE: Order price must be positive and finite")
 
-            limit_state = rule.get("limit_state")
-            if limit_state == "BOUNDED":
+            if limit_state in ("BOUNDED", "UNBOUNDED"):
                 if benchmark_price is None or not isinstance(benchmark_price, (int, float)) or not math.isfinite(benchmark_price) or benchmark_price <= 0:
                     return OrderValidationResult(
                         is_valid=False,
@@ -216,13 +256,15 @@ class AShareOrderGateway:
                         rejection_reason=f"PRICE_COLLAR_VIOLATION: Order price {order_price} violates 2% collar with benchmark {benchmark_price}",
                     )
 
-        # 7. 校验通过，原子预留卖出数量并记录活动订单
+        # 7. 校验通过，原子预留卖出数量并记录活动订单及申报总量 (Q06)
         if order.side == OrderSide.SELL:
             self._reserved_sell_shares[symbol] = self._reserved_sell_shares.get(symbol, Decimal("0")) + qty
             self._order_reserved_qty[order_id_str] = qty
 
         self._active_orders[order_id_str] = order
         self._order_symbol[order_id_str] = symbol
+        self._order_declared_qty[order_id_str] = qty
+        self._order_cum_filled_qty[order_id_str] = Decimal("0.0")
         return OrderValidationResult(is_valid=True)
 
     def on_order_filled(self, event) -> str:
@@ -246,6 +288,21 @@ class AShareOrderGateway:
         order_id_str = str(event.client_order_id)
         fill_qty = Decimal(str(event.last_qty.as_double()))
         symbol = str(event.instrument_id.symbol)
+
+        # 1.1 校验成交订单是否经由网关风控登记 (Q06)
+        if order_id_str not in self._order_declared_qty:
+            raise RuntimeError(
+                f"Untracked order fill received: client_order_id '{order_id_str}' was not validated/reserved by gateway"
+            )
+
+        # 1.2 校验累计成交量是否超单 (Q06)
+        declared_qty = self._order_declared_qty[order_id_str]
+        cum_qty = self._order_cum_filled_qty.get(order_id_str, Decimal("0.0")) + fill_qty
+        if cum_qty > declared_qty:
+            raise RuntimeError(
+                f"Cumulative fill quantity {cum_qty} exceeds declared order quantity {declared_qty} for order {order_id_str}"
+            )
+        self._order_cum_filled_qty[order_id_str] = cum_qty
 
         if event.order_side == OrderSide.BUY:
             if symbol not in self._bought_lots:
@@ -295,6 +352,10 @@ class AShareOrderGateway:
 
     def on_order_expired(self, client_order_id: str, symbol: Optional[str] = None) -> None:
         """原生 EXPIRED 回调：释放卖单预留 (N02)"""
+        self._release_order_reservation(client_order_id, symbol)
+
+    def on_order_denied(self, client_order_id: str, symbol: Optional[str] = None) -> None:
+        """原生 DENIED 回调：释放卖单预留 (Q05)"""
         self._release_order_reservation(client_order_id, symbol)
 
     def on_order_canceled_or_rejected(self, client_order_id: str, symbol: Optional[str] = None) -> None:
