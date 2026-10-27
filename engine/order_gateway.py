@@ -35,6 +35,35 @@ from engine.market_rules import validate_price_collar, block_reason
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
+def execution_context(order, rule, bar):
+    """Resolve mandatory execution time and verify the phase against exchange hours."""
+    ts = bar.get("execution_ts") or bar.get("ts_init") or bar.get("ts_event") or order.ts_init
+    if not isinstance(ts, int) or ts <= 0:
+        raise ValueError("MISSING_EXECUTION_TIME")
+    dt = datetime.fromtimestamp(ts / 1e9, SHANGHAI_TZ)
+    minute = dt.hour * 60 + dt.minute
+    if dt.weekday() >= 5:
+        raise ValueError("MARKET_SESSION_CLOSED")
+    if 555 <= minute < 565:
+        phase = "OPENING_AUCTION"
+    elif 570 <= minute < 690 or 780 <= minute < 897:
+        phase = "CONTINUOUS"
+    elif 897 <= minute < 900:
+        phase = "CLOSING_AUCTION"
+    else:
+        raise ValueError("MARKET_SESSION_CLOSED")
+    supplied = str(rule.get("session_phase") or bar.get("session_phase") or phase).upper()
+    if supplied == "CONTINUOUS_AUCTION":
+        supplied = "CONTINUOUS"
+    if supplied == "CALL_AUCTION" and phase.endswith("AUCTION"):
+        supplied = phase
+    if supplied not in {"CONTINUOUS", "OPENING_AUCTION", "CLOSING_AUCTION"}:
+        raise ValueError("INVALID_SESSION_PHASE")
+    if supplied != phase:
+        raise ValueError("SESSION_PHASE_TIME_MISMATCH")
+    return dt.strftime("%Y-%m-%d"), phase
+
+
 @dataclass
 class OrderValidationResult:
     is_valid: bool
@@ -53,12 +82,14 @@ class AShareOrderGateway:
 
         # 批次化买入批次 (N01): symbol -> List[(buy_date_str, qty)]
         self._bought_lots: Dict[str, List[Tuple[str, Decimal]]] = {}
+        self._pending_listings = []
 
         # 订单跟踪：client_order_id -> Order
         self._active_orders: Dict[str, Order] = {}
         self._order_reserved_qty: Dict[str, Decimal] = {}
         self._order_symbol: Dict[str, str] = {}
         self._order_side: Dict[str, OrderSide] = {}
+        self._order_instrument: Dict[str, str] = {}
         self._order_declared_qty: Dict[str, Decimal] = {}
         self._order_cum_filled_qty: Dict[str, Decimal] = {}
 
@@ -67,6 +98,7 @@ class AShareOrderGateway:
 
         # 当前会话日期
         self._current_session_date: Optional[str] = None
+        self._closed_date: Optional[str] = None
 
     def on_trade_day_start(self, trade_date: str) -> None:
         """
@@ -86,6 +118,7 @@ class AShareOrderGateway:
                 return
 
         self._current_session_date = trade_date
+        self._closed_date = None
 
         # 扫描历史买入批次，将已跨日 (lot_date < trade_date) 的股份结算
         for sym, lot_list in list(self._bought_lots.items()):
@@ -99,14 +132,20 @@ class AShareOrderGateway:
                 self._bought_lots[sym] = remaining_lots
             else:
                 self._bought_lots.pop(sym, None)
+        pending=[]
+        for listing_day,symbol,qty in self._pending_listings:
+            if listing_day <= trade_date:
+                self._settled_shares[symbol]=self._settled_shares.get(symbol,Decimal(0))+qty
+            else: pending.append((listing_day,symbol,qty))
+        self._pending_listings=pending
 
-    def apply_stock_split(self, symbol: str, split_ratio: Decimal | float) -> None:
+    def apply_stock_split(self, symbol: str, split_ratio: Decimal | float, *, share_listing_date=None, trade_date=None) -> None:
         """
         【Q08, V03】公司行为拆股 / 送转股结算持仓与历史买入批次联动同步
         采用与 GoldenLedger 严格一致的账户级总持仓取整与批次舍入补偿算法，保证总权益严格守恒。
         """
         ratio = Decimal(str(split_ratio))
-        if ratio <= Decimal("0.0"):
+        if not ratio.is_finite() or ratio <= Decimal("0.0"):
             raise ValueError(f"Split ratio must be positive, got {ratio}")
 
         total_held = self.get_total_position(symbol)
@@ -115,6 +154,12 @@ class AShareOrderGateway:
 
         # 账户级总持仓目标整数值
         target_total = (total_held * ratio).to_integral_value(rounding=ROUND_FLOOR)
+        if any(s==symbol for _,s,_ in self._pending_listings):
+            raise ValueError("Overlapping pending share listings are not supported")
+        if share_listing_date is not None and str(share_listing_date)>str(trade_date):
+            if trade_date is None or ratio<1:raise ValueError("Invalid delayed listing context")
+            self._pending_listings.append((str(share_listing_date),symbol,target_total-total_held))
+            return
 
         # 逐批次向下取整
         if symbol in self._settled_shares:
@@ -157,7 +202,8 @@ class AShareOrderGateway:
         """
         settled = self._settled_shares.get(symbol, Decimal("0"))
         unsettled = sum((q for _, q in self._bought_lots.get(symbol, [])), Decimal("0"))
-        return settled + unsettled
+        pending = sum((q for _,s,q in self._pending_listings if s==symbol),Decimal(0))
+        return settled + unsettled + pending
 
     def validate_and_reserve(
         self,
@@ -173,6 +219,17 @@ class AShareOrderGateway:
         symbol = str(order.instrument_id.symbol)
         side_str = "buy" if order.side == OrderSide.BUY else "sell"
         qty = Decimal(str(order.quantity.as_double()))
+
+        if not isinstance(rule, dict) or not isinstance(bar, dict):
+            return OrderValidationResult(False, "INVALID_EXECUTION_CONTEXT")
+        try:
+            trade_date, session_phase = execution_context(order, rule, bar)
+        except (ValueError, OverflowError, OSError) as exc:
+            return OrderValidationResult(False, str(exc))
+        if self._closed_date == trade_date:
+            return OrderValidationResult(False, "MARKET_SESSION_CLOSED")
+        if self._current_session_date is not None and trade_date != self._current_session_date:
+            return OrderValidationResult(False, "TRADE_DATE_MISMATCH: advance the trading day first")
 
         # 1. 幂等订单身份检查 (N03)
         if order_id_str in self._active_orders:
@@ -245,19 +302,6 @@ class AShareOrderGateway:
                 rejection_reason="MARKET_SESSION_CLOSED: Market is currently closed",
             )
 
-        bar_ts = bar.get("ts_event") or bar.get("ts_init")
-        if bar_ts is not None and order.time_in_force == TimeInForce.DAY:
-            dt_bar = datetime.fromtimestamp(bar_ts / 1e9, tz=SHANGHAI_TZ)
-            if dt_bar.hour >= 15:
-                return OrderValidationResult(
-                    is_valid=False,
-                    rejection_reason="SESSION_CLOSED: Market session closed at 15:00:00, cannot accept DAY orders after close",
-                )
-
-        session_phase = str(
-            rule.get("session_phase") or bar.get("session_phase") or "CONTINUOUS"
-        ).upper()
-
         limit_state = rule.get("limit_state")
         if limit_state == "BOUNDED":
             lo, hi = rule.get("down_limit"), rule.get("up_limit")
@@ -277,6 +321,16 @@ class AShareOrderGateway:
                 )
 
         order_price = order.price.as_double() if hasattr(order, "price") and order.price else None
+        if order_price is not None and limit_state == "UNBOUNDED" and session_phase != "CONTINUOUS":
+            reference = rule.get("issue_price") if session_phase == "OPENING_AUCTION" and rule.get("ipo_first_day") else rule.get("prev_close")
+            if session_phase == "CLOSING_AUCTION":
+                reference = bar.get("close")
+            if not isinstance(reference, (int, float)) or not math.isfinite(reference) or reference <= 0:
+                return OrderValidationResult(False, "AUCTION_REFERENCE_REQUIRED")
+            lo = 0 if session_phase == "OPENING_AUCTION" else reference * .9
+            hi = reference * (9 if session_phase == "OPENING_AUCTION" else 1.1)
+            if not lo < order_price <= hi + 1e-8:
+                return OrderValidationResult(False, "AUCTION_PRICE_OUTSIDE_RANGE")
         reason = block_reason(rule, bar, side_str, execution_price=order_price)
         if reason is not None:
             return OrderValidationResult(is_valid=False, rejection_reason=reason)
@@ -310,7 +364,10 @@ class AShareOrderGateway:
             self._order_reserved_qty[order_id_str] = qty
 
         self._active_orders[order_id_str] = order
+        if self._current_session_date is None:
+            self.on_trade_day_start(trade_date)
         self._order_symbol[order_id_str] = symbol
+        self._order_instrument[order_id_str] = str(order.instrument_id)
         self._order_side[order_id_str] = order.side
         self._order_declared_qty[order_id_str] = qty
         self._order_cum_filled_qty[order_id_str] = Decimal("0.0")
@@ -343,6 +400,10 @@ class AShareOrderGateway:
             raise RuntimeError(
                 f"Untracked order fill received: client_order_id '{order_id_str}' was not validated/reserved by gateway"
             )
+        if str(event.instrument_id) != self._order_instrument.get(order_id_str):
+            raise RuntimeError(f"Instrument identity mismatch for order '{order_id_str}'")
+        if not fill_qty.is_finite() or fill_qty <= 0:
+            raise RuntimeError("Invalid fill quantity")
 
         # 2.2 校验标的证券代码是否与报单申报严格一致 (V06)
         expected_sym = self._order_symbol.get(order_id_str)
@@ -434,6 +495,7 @@ class AShareOrderGateway:
         """
         日终收市处理：清理所有活动挂单，释放预留，并返回到期的订单 ID 集合以供向原生引擎撤单
         """
+        self._closed_date = self._current_session_date
         expired_order_ids = set(self._active_orders.keys())
         for order_id in list(self._active_orders.keys()):
             self._release_order_reservation(order_id)

@@ -6,8 +6,8 @@ A 股独立参考黄金账本 (Golden Ledger)
 """
 
 from __future__ import annotations
-from datetime import date
-from decimal import Decimal, ROUND_FLOOR
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from typing import Dict, List, Any, Set, Optional, Tuple
 from contracts import DailyNAV, Fill, OrderSide, CorporateAction
 
@@ -76,7 +76,9 @@ class GoldenLedger:
                 self.tradable_positions[sym] = self.tradable_positions.get(sym, Decimal("0")) + qty
                 if sym not in self.lots:
                     self.lots[sym] = []
-                self.lots[sym].append((str(list_d), qty))
+                # Company-action stock is sellable on listing day, unlike a purchase that day.
+                # The journal retains actual event dates; lot dates are settlement references.
+                self.lots[sym].append((str(list_d-timedelta(days=1)), qty))
             else:
                 remaining_listings.append((list_d, sym, qty))
         self.pending_listing_shares = remaining_listings
@@ -119,17 +121,11 @@ class GoldenLedger:
             if current_tradable < fill.quantity:
                 raise ValueError(f"Ledger T+1 violation on {fill.symbol}: tradable {current_tradable}, selling {fill.quantity}")
 
-            # 校验通过，原子更新
-            total_inflow = trade_val - fill.fee
-            self.cash += total_inflow
-            self.positions[fill.symbol] -= fill.quantity
-            self.tradable_positions[fill.symbol] -= fill.quantity
-
             # 扣减 lots (FIFO 优先扣除最早股份，Q02 消除幽灵批次与负持仓)
             rem = fill.quantity
             new_lots = []
             for lot_date, q in self.lots.get(fill.symbol, []):
-                if rem > 0:
+                if rem > 0 and lot_date < trade_date:
                     if q <= rem:
                         rem -= q
                     else:
@@ -143,23 +139,22 @@ class GoldenLedger:
                     f"Fatal lot inconsistency: failed to deduct {rem} shares from lots for {fill.symbol}"
                 )
 
-            # 持仓归零清理与批次强守恒校验 (Q02)
-            if self.positions[fill.symbol] == Decimal("0.0"):
-                self.lots[fill.symbol] = []
-                self.tradable_positions[fill.symbol] = Decimal("0.0")
-            else:
-                self.lots[fill.symbol] = new_lots
-
             # 强守恒校验：已上市批次 + 待上市批次 严格恒等于 总持仓
             pending_bonus = sum(
                 (q for ld, s, q in self.pending_listing_shares if s == fill.symbol),
                 Decimal("0.0"),
             )
-            lot_sum = sum((q for _, q in self.lots.get(fill.symbol, [])), Decimal("0.0"))
-            if lot_sum + pending_bonus != self.positions[fill.symbol]:
+            lot_sum = sum((q for _, q in new_lots), Decimal("0.0"))
+            remaining_position=self.positions.get(fill.symbol,Decimal(0))-fill.quantity
+            if lot_sum + pending_bonus != remaining_position:
                 raise RuntimeError(
-                    f"Lot conservation violated for {fill.symbol}: lots sum {lot_sum} + pending {pending_bonus} != position {self.positions[fill.symbol]}"
+                    f"Lot conservation violated for {fill.symbol}: lots sum {lot_sum} + pending {pending_bonus} != position {remaining_position}"
                 )
+
+            self.cash += trade_val-fill.fee
+            self.positions[fill.symbol]=remaining_position
+            self.tradable_positions[fill.symbol]-=fill.quantity
+            self.lots[fill.symbol]=new_lots
 
         # 4. 全部修改成功后，记录成交历史与去重标记
         self.fills.append(fill)
@@ -171,7 +166,7 @@ class GoldenLedger:
         """
         held = self.positions.get(symbol, Decimal("0.0"))
         if held > 0 and cash_per_share > 0:
-            total_div = (held * cash_per_share).quantize(Decimal("0.01"))
+            total_div = (held * cash_per_share).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             self.cash += total_div
             return total_div
         return Decimal("0.0")
@@ -193,7 +188,7 @@ class GoldenLedger:
         - 'cash_in_lieu': 零碎部分按除权基准价（或指定折算价）折算为现金补足入账，严禁使用虚构价格或旧单位价格。
         """
         split_ratio = Decimal(str(split_ratio))
-        if split_ratio <= Decimal("0.0"):
+        if not split_ratio.is_finite() or split_ratio <= Decimal("0.0"):
             raise ValueError(f"Split ratio must be positive, got {split_ratio}")
 
         if fractional_policy not in ("floor", "reject", "cash_in_lieu"):
@@ -202,6 +197,8 @@ class GoldenLedger:
             )
 
         cur_d = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
+        if self.last_valuation_date and str(cur_d) < self.last_valuation_date:
+            raise ValueError("Company action predates the latest valuation")
         orig_held = self.positions.get(symbol, Decimal("0.0"))
         if orig_held <= Decimal("0.0"):
             return
@@ -219,14 +216,18 @@ class GoldenLedger:
             if fractional_cash_price is not None:
                 px = Decimal(str(fractional_cash_price))
             elif symbol in self.latest_prices:
-                pre_split_px, _ = self.latest_prices[symbol]
+                pre_split_px, price_date = self.latest_prices[symbol]
+                if price_date >= str(cur_d):
+                    raise ValueError("A strictly prior pre-split valuation is required")
                 # 除权基准参考价 = 拆前价格 / 拆分比例 (新单位公允价格)
                 px = (pre_split_px / split_ratio).quantize(Decimal("0.0001"))
             else:
                 raise ValueError(
                     f"Missing valid valuation price for cash_in_lieu calculation on {symbol}"
                 )
-            cash_comp = (frac * px).quantize(Decimal("0.01"))
+            if not px.is_finite() or px <= 0:
+                raise ValueError("Cash-in-lieu price must be positive and finite")
+            cash_comp = (frac * px).quantize(Decimal("0.01"),rounding=ROUND_HALF_UP)
             self.cash += cash_comp
             new_total_held = floored_held
         else:
@@ -255,6 +256,7 @@ class GoldenLedger:
                     updated_lots[0] = (d0, q0 + diff)
 
                 self.lots[symbol] = updated_lots
+                self.tradable_positions[symbol] = sum((q for d,q in updated_lots if d<str(cur_d)),Decimal(0))
         else:
             # 原持仓保持可卖状态，新产生的股份挂入 pending_listing_shares，待 share_listing_date 上市日才解冻到账 (N06)
             self.pending_listing_shares.append((share_listing_date, symbol, bonus_qty))
@@ -313,7 +315,7 @@ class GoldenLedger:
 
                 # 2.2 确认应收分红 (N07: 确保除息日价格下跌时，应收分红维持净值守恒)
                 if action.cash_div > Decimal("0.0") and f"{act_id}_receivable" not in self.processed_action_ids:
-                    receivable_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"))
+                    receivable_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                     self.receivable_dividends[act_id] = receivable_cash
                     self.processed_action_ids.add(f"{act_id}_receivable")
 
@@ -332,7 +334,7 @@ class GoldenLedger:
                         entitled_qty = self.dividend_entitlements.get(
                             act_id, self.positions.get(action.symbol, Decimal("0.0"))
                         )
-                        div_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"))
+                        div_cash = (entitled_qty * action.cash_div).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
                     self.cash += div_cash
                     self.processed_action_ids.add(f"{act_id}_paid")

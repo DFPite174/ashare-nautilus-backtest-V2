@@ -359,6 +359,8 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
     【Q08, V04 验证】端到端全链路闭环：
     BacktestEngine 原生撮合买入 -> 登记日收盘自动锁定分红权益快照 -> 策略与 Position 原生拆股 -> 网关与黄金账本多轨同步 -> 派息日分红入账 -> 原生撮合卖出全部持仓 -> 现金额度与持仓零漂移对账
     """
+    from engine.accounting import AShareAccountModule
+    cash_module = AShareAccountModule()
     SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
     def b2u(s):
         dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
@@ -418,6 +420,7 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
                 elif bar.ts_event >= b2u("2025-05-06 15:00:00"):
                     # 登记日收盘盯市：自动锁定登记日收盘持仓快照 (100 股) 作为合法分红权益基准 (V04)
                     self.ledger.mark_to_market(d_str, {"600519": Decimal("100.00")})
+                    cash_module.record_entitlement(self.ca, self.portfolio.net_position(self.inst.id))
 
             elif d_str == "2025-05-07":
                 if not self.split_applied:
@@ -426,6 +429,7 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
                     # 容错：若未在昨日收市盯市，在跨日除权前封存昨日登记日收盘快照 (V04)
                     if self.ledger.last_valuation_date != "2025-05-06":
                         self.ledger.mark_to_market("2025-05-06", {"600519": Decimal("100.00")})
+                        cash_module.record_entitlement(self.ca, self.portfolio.net_position(self.inst.id))
                     # 除权除息日处理：100 股确认 200 元应收分红，且送转拆股 1:1
                     self.ledger.process_corporate_actions_for_date(d_str)
                     self.gateway.apply_stock_split("600519", 2.0)
@@ -439,6 +443,7 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
                 self.ledger.on_trade_day_start(d_str)
                 # 派息日：200 元现金分红到账转入可用现金 (V04)
                 self.ledger.process_corporate_actions_for_date(d_str)
+                cash_module.pay_dividend(self.ca, d_str)
                 # 卖出全部 200 股 @ 50.00
                 order = self.order_factory.limit(self.inst.id, OrderSide.SELL, Quantity.from_int(200), Price.from_str("50.00"), TimeInForce.DAY)
                 assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=50.0).is_valid
@@ -448,7 +453,7 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
     cfg = BacktestEngineConfig(trader_id=TraderId("TRADER-001"), logging=LoggingConfig(log_level="ERROR"))
     eng = BacktestEngine(config=cfg)
     v = Venue("SSE")
-    eng.add_venue(venue=v, oms_type=OmsType.NETTING, account_type=AccountType.CASH, base_currency=CNY, starting_balances=[Money(100000.0, CNY)])
+    eng.add_venue(venue=v, oms_type=OmsType.NETTING, account_type=AccountType.CASH, base_currency=CNY, starting_balances=[Money(100000.0, CNY)], modules=[cash_module])
     sym = Symbol("600519")
     inst_id = InstrumentId(sym, v)
     t0 = b2u("2025-05-01 09:30:00")
@@ -477,6 +482,8 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
     assert strat.ledger.receivable_dividends == {}
     # 现金对账：初始 100,000 - 买入 10,000 + 卖出 10,000 + 现金分红 200 = 100,200.0 元！
     assert strat.ledger.cash == Decimal("100200.0")
+    assert float(eng.portfolio.account(v).balances_total()[CNY]) == 100200.
+    assert cash_module.pay_dividend(strat.ca, "2025-05-08") == Decimal(0)
 
 
 def test_gateway_and_ledger_split_allocation_parity_multi_lot():
