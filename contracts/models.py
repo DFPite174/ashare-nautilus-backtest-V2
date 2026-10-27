@@ -127,6 +127,10 @@ class CorporateAction(BaseModel):
         default="floor",
         description="公司行为零碎股处理策略: 'floor' (向下取整，默认), 'reject' (存在零碎股时抛出异常), 'cash_in_lieu' (零碎部分现金折现)",
     )
+    fractional_cash_price: Optional[Decimal] = Field(
+        default=None,
+        description="零碎股现金替代折算单价（元/股，若未提供则按除权基准价自动推导）",
+    )
 
 
 class ExecutionAssumptions(BaseModel):

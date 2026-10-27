@@ -58,6 +58,7 @@ class AShareOrderGateway:
         self._active_orders: Dict[str, Order] = {}
         self._order_reserved_qty: Dict[str, Decimal] = {}
         self._order_symbol: Dict[str, str] = {}
+        self._order_side: Dict[str, OrderSide] = {}
         self._order_declared_qty: Dict[str, Decimal] = {}
         self._order_cum_filled_qty: Dict[str, Decimal] = {}
 
@@ -101,12 +102,21 @@ class AShareOrderGateway:
 
     def apply_stock_split(self, symbol: str, split_ratio: Decimal | float) -> None:
         """
-        【Q08】公司行为拆股 / 送转股结算持仓与历史买入批次联动同步
+        【Q08, V03】公司行为拆股 / 送转股结算持仓与历史买入批次联动同步
+        采用与 GoldenLedger 严格一致的账户级总持仓取整与批次舍入补偿算法，保证总权益严格守恒。
         """
         ratio = Decimal(str(split_ratio))
         if ratio <= Decimal("0.0"):
             raise ValueError(f"Split ratio must be positive, got {ratio}")
 
+        total_held = self.get_total_position(symbol)
+        if total_held <= Decimal("0.0"):
+            return
+
+        # 账户级总持仓目标整数值
+        target_total = (total_held * ratio).to_integral_value(rounding=ROUND_FLOOR)
+
+        # 逐批次向下取整
         if symbol in self._settled_shares:
             self._settled_shares[symbol] = (
                 self._settled_shares[symbol] * ratio
@@ -119,6 +129,18 @@ class AShareOrderGateway:
                     (d, (q * ratio).to_integral_value(rounding=ROUND_FLOOR))
                 )
             self._bought_lots[symbol] = updated_lots
+
+        # 计算舍入差额并补偿至最早批次 (发生时间优先原则，与 GoldenLedger 严格对齐)
+        current_total = self.get_total_position(symbol)
+        diff = target_total - current_total
+        if diff != Decimal("0.0"):
+            if symbol in self._settled_shares and self._settled_shares[symbol] > Decimal("0.0"):
+                self._settled_shares[symbol] += diff
+            elif symbol in self._bought_lots and len(self._bought_lots[symbol]) > 0:
+                d, q = self._bought_lots[symbol][0]
+                self._bought_lots[symbol][0] = (d, q + diff)
+            else:
+                self._settled_shares[symbol] = self._settled_shares.get(symbol, Decimal("0.0")) + diff
 
     def get_sellable_qty(self, symbol: str) -> Decimal:
         """
@@ -215,7 +237,27 @@ class AShareOrderGateway:
         if vol is None or not isinstance(vol, (int, float)) or not math.isfinite(vol) or vol < 0:
             return OrderValidationResult(is_valid=False, rejection_reason="INVALID_BAR_VOLUME: Bar volume must be non-negative and finite")
 
-        # 5. 市场规则与停牌/涨跌停阻断校验 (Fail-safe, Q04)
+        # 5. 市场规则与停牌/涨跌停阻断校验 (Fail-safe, Q04, V01)
+        trade_status = str(rule.get("trade_status") or "").upper()
+        if trade_status in ("CLOSED", "SESSION_CLOSED"):
+            return OrderValidationResult(
+                is_valid=False,
+                rejection_reason="MARKET_SESSION_CLOSED: Market is currently closed",
+            )
+
+        bar_ts = bar.get("ts_event") or bar.get("ts_init")
+        if bar_ts is not None and order.time_in_force == TimeInForce.DAY:
+            dt_bar = datetime.fromtimestamp(bar_ts / 1e9, tz=SHANGHAI_TZ)
+            if dt_bar.hour >= 15:
+                return OrderValidationResult(
+                    is_valid=False,
+                    rejection_reason="SESSION_CLOSED: Market session closed at 15:00:00, cannot accept DAY orders after close",
+                )
+
+        session_phase = str(
+            rule.get("session_phase") or bar.get("session_phase") or "CONTINUOUS"
+        ).upper()
+
         limit_state = rule.get("limit_state")
         if limit_state == "BOUNDED":
             lo, hi = rule.get("down_limit"), rule.get("up_limit")
@@ -239,22 +281,28 @@ class AShareOrderGateway:
         if reason is not None:
             return OrderValidationResult(is_valid=False, rejection_reason=reason)
 
-        # 6. 2% 价格笼子校验 (N04 & Q03: 限价单在 BOUNDED 或 UNBOUNDED 交易状态下，均须执行价格笼子校验)
+        # 6. 2% 价格笼子校验 (N04, Q03, V05)
+        # 官方规则：2% 价格笼子仅在连续竞价阶段 (CONTINUOUS) 生效；
+        # 集合竞价 (OPENING_AUCTION, CLOSING_AUCTION, CALL_AUCTION) 仅受当日涨跌幅价格带限制，不适用 2% 价格笼子。
         if order_price is not None:
             if not math.isfinite(order_price) or order_price <= 0:
                 return OrderValidationResult(is_valid=False, rejection_reason="INVALID_ORDER_PRICE: Order price must be positive and finite")
 
-            if limit_state in ("BOUNDED", "UNBOUNDED"):
-                if benchmark_price is None or not isinstance(benchmark_price, (int, float)) or not math.isfinite(benchmark_price) or benchmark_price <= 0:
-                    return OrderValidationResult(
-                        is_valid=False,
-                        rejection_reason="BENCHMARK_PRICE_REQUIRED: Valid positive finite benchmark_price is required for price collar validation",
-                    )
-                if not validate_price_collar(order_price, benchmark_price, side_str):
-                    return OrderValidationResult(
-                        is_valid=False,
-                        rejection_reason=f"PRICE_COLLAR_VIOLATION: Order price {order_price} violates 2% collar with benchmark {benchmark_price}",
-                    )
+            if session_phase in ("CONTINUOUS", "CONTINUOUS_AUCTION"):
+                if limit_state in ("BOUNDED", "UNBOUNDED"):
+                    if benchmark_price is None or not isinstance(benchmark_price, (int, float)) or not math.isfinite(benchmark_price) or benchmark_price <= 0:
+                        return OrderValidationResult(
+                            is_valid=False,
+                            rejection_reason="BENCHMARK_PRICE_REQUIRED: Valid positive finite benchmark_price is required for price collar validation in continuous auction",
+                        )
+                    if not validate_price_collar(order_price, benchmark_price, side_str):
+                        return OrderValidationResult(
+                            is_valid=False,
+                            rejection_reason=f"PRICE_COLLAR_VIOLATION: Order price {order_price} violates 2% collar with benchmark {benchmark_price} in continuous auction",
+                        )
+            elif session_phase in ("OPENING_AUCTION", "CLOSING_AUCTION", "CALL_AUCTION"):
+                # 集合竞价：严格由涨跌停价格带约束，若超限在第 5 步 block_reason 已拦截
+                pass
 
         # 7. 校验通过，原子预留卖出数量并记录活动订单及申报总量 (Q06)
         if order.side == OrderSide.SELL:
@@ -263,6 +311,7 @@ class AShareOrderGateway:
 
         self._active_orders[order_id_str] = order
         self._order_symbol[order_id_str] = symbol
+        self._order_side[order_id_str] = order.side
         self._order_declared_qty[order_id_str] = qty
         self._order_cum_filled_qty[order_id_str] = Decimal("0.0")
         return OrderValidationResult(is_valid=True)
@@ -280,28 +329,45 @@ class AShareOrderGateway:
         dt = datetime.fromtimestamp(event.ts_event / 1e9, tz=SHANGHAI_TZ)
         fill_date = dt.strftime("%Y-%m-%d")
 
-        # 1. 幂等去重检查 (N03)
+        # 1. 幂等去重检查 (N03): 若已完整成功处理，直接返回
         if trade_id in self._processed_trade_ids:
             return fill_date
-        self._processed_trade_ids.add(trade_id)
 
         order_id_str = str(event.client_order_id)
         fill_qty = Decimal(str(event.last_qty.as_double()))
         symbol = str(event.instrument_id.symbol)
 
-        # 1.1 校验成交订单是否经由网关风控登记 (Q06)
+        # 2. 前置完整性与身份契约校验 (Q06, V06)
+        # 2.1 校验成交订单是否经由网关风控登记
         if order_id_str not in self._order_declared_qty:
             raise RuntimeError(
                 f"Untracked order fill received: client_order_id '{order_id_str}' was not validated/reserved by gateway"
             )
 
-        # 1.2 校验累计成交量是否超单 (Q06)
+        # 2.2 校验标的证券代码是否与报单申报严格一致 (V06)
+        expected_sym = self._order_symbol.get(order_id_str)
+        if symbol != expected_sym:
+            raise RuntimeError(
+                f"Instrument symbol mismatch for order '{order_id_str}': expected '{expected_sym}', got '{symbol}'"
+            )
+
+        # 2.3 校验订单买卖方向是否与报单申报严格一致 (V06)
+        expected_side = self._order_side.get(order_id_str)
+        if expected_side is not None and event.order_side != expected_side:
+            raise RuntimeError(
+                f"Order side mismatch for order '{order_id_str}': expected {expected_side}, got {event.order_side}"
+            )
+
+        # 2.4 校验累计成交量是否超单 (Q06)
         declared_qty = self._order_declared_qty[order_id_str]
         cum_qty = self._order_cum_filled_qty.get(order_id_str, Decimal("0.0")) + fill_qty
         if cum_qty > declared_qty:
             raise RuntimeError(
                 f"Cumulative fill quantity {cum_qty} exceeds declared order quantity {declared_qty} for order {order_id_str}"
             )
+
+        # 3. 校验全部通过后，原子提交去重记录与状态流转 (V06)
+        self._processed_trade_ids.add(trade_id)
         self._order_cum_filled_qty[order_id_str] = cum_qty
 
         if event.order_side == OrderSide.BUY:
@@ -329,6 +395,7 @@ class AShareOrderGateway:
             self._active_orders.pop(order_id_str, None)
             self._order_reserved_qty.pop(order_id_str, None)
             self._order_symbol.pop(order_id_str, None)
+            self._order_side.pop(order_id_str, None)
 
         return fill_date
 
@@ -341,6 +408,7 @@ class AShareOrderGateway:
             self._reserved_sell_shares[sym] = max(Decimal("0"), current_reserved - reserved)
         self._active_orders.pop(client_order_id, None)
         self._order_symbol.pop(client_order_id, None)
+        self._order_side.pop(client_order_id, None)
 
     def on_order_canceled(self, client_order_id: str, symbol: Optional[str] = None) -> None:
         """原生 CANCELED 回调：释放卖单未成交预留 (N02)"""

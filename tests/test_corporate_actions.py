@@ -307,7 +307,11 @@ def test_corporate_action_bonus_shares_listing_fifo_sell_no_ghost_inventory():
 
 def test_corporate_action_fractional_share_policies():
     """
-    【Q07 验证】公司行为零碎股处理策略 (floor, reject, cash_in_lieu)
+    【Q07, V02 验证】公司行为零碎股处理策略 (floor, reject, cash_in_lieu)：
+    - floor: 向下取整
+    - reject: 存在零碎股时严格抛出异常
+    - cash_in_lieu: 严格按除权基准参考价 (或指定折算价) 折算现金入账，严禁使用虚构价格或旧单位价格
+    - 未知非法策略: 严格报错拦截，绝不静默降级为 floor
     """
     # 1. 默认 floor 策略
     l_floor = GoldenLedger(initial_cash=Decimal("100000.0"))
@@ -324,22 +328,36 @@ def test_corporate_action_fractional_share_policies():
     with pytest.raises(ValueError, match="Fractional share detected"):
         l_reject.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="reject")
 
-    # 3. cash_in_lieu 策略：零碎部分折算现金
+    # 3. 未知非法策略 (如拼写错误 TYPO)：严格报错，绝不静默降级为 floor (V02)
+    l_typo = GoldenLedger(initial_cash=Decimal("100000.0"))
+    l_typo.positions["600519"] = Decimal("105.0")
+    with pytest.raises(ValueError, match="Invalid fractional_policy 'TYPO'"):
+        l_typo.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="TYPO")
+
+    # 4. cash_in_lieu 策略在缺乏有效估值价格时必须报错拒绝 (V02)
+    l_nopx = GoldenLedger(initial_cash=Decimal("100000.0"))
+    l_nopx.positions["600519"] = Decimal("105.0")
+    with pytest.raises(ValueError, match="Missing valid valuation price"):
+        l_nopx.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="cash_in_lieu")
+
+    # 5. cash_in_lieu 策略：严格使用除权基准价 (拆前价 / 拆分比例) 折算现金，保持经济价值严格守恒 (V02)
+    # 原 105 股 * 10.0 元 = 1050.0 元；拆分比例 1.5，拆后除权基准价 = 10.0 / 1.5 = 6.6667 元/股
+    # 拆后新股 157.5 股 -> 整股 157 股，零碎 0.5 股 * 6.6667 元 = 3.33 元现金补足入账
+    # 总财富 = 157 股 * 6.6667 + 3.33 = 1046.67 + 3.33 = 1050.00 元！
     l_cash = GoldenLedger(initial_cash=Decimal("100000.0"))
     l_cash.positions["600519"] = Decimal("105.0")
     l_cash.tradable_positions["600519"] = Decimal("105.0")
     l_cash.lots["600519"] = [("2025-05-01", Decimal("105.0"))]
     l_cash.latest_prices["600519"] = (Decimal("10.00"), "2025-05-05")
-    # 0.5 股 * 10.00 元 = 5.00 元现金补足入账，持仓取整为 157
     l_cash.apply_stock_split("600519", Decimal("1.5"), "2025-05-06", fractional_policy="cash_in_lieu")
     assert l_cash.positions["600519"] == Decimal("157.0")
-    assert l_cash.cash == Decimal("100005.00")
+    assert l_cash.cash == Decimal("100003.33")
 
 
 def test_corporate_action_e2e_engine_split_and_reconciliation():
     """
-    【Q08 验证】端到端全链路闭环：
-    BacktestEngine 原生撮合买入 -> 策略与 Position 原生拆股 -> 网关与黄金账本多轨同步 -> 原生撮合卖出全部持仓 -> 双账本零漂移对账
+    【Q08, V04 验证】端到端全链路闭环：
+    BacktestEngine 原生撮合买入 -> 登记日收盘自动锁定分红权益快照 -> 策略与 Position 原生拆股 -> 网关与黄金账本多轨同步 -> 派息日分红入账 -> 原生撮合卖出全部持仓 -> 现金额度与持仓零漂移对账
     """
     SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
     def b2u(s):
@@ -355,11 +373,14 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
             self.gateway = AShareOrderGateway()
             self.bridge = load_bridge()
             self.split_applied = False
+            # 包含 10 送 10 (比例 1.0) 及每股派现 2.0 元 (V04)
             self.ca = CorporateAction(
                 symbol="600519",
                 record_date=date(2025, 5, 6),
                 ex_date=date(2025, 5, 7),
+                pay_date=date(2025, 5, 8),
                 bonus_ratio=Decimal("1.0"),
+                cash_div=Decimal("2.0"),
             )
             self.ledger.register_corporate_action(self.ca)
 
@@ -387,29 +408,42 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
             bar_dict = {"close": bar.close.as_double(), "volume": 10000.0}
 
             if d_str == "2025-05-06":
+                # 登记日开盘：申报买入 100 股
                 self.gateway.on_trade_day_start(d_str)
                 self.ledger.on_trade_day_start(d_str)
-                self.ledger.process_corporate_actions_for_date(d_str)
-                order = self.order_factory.limit(self.inst.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("100.00"), TimeInForce.DAY)
-                assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=100.0).is_valid
-                self.submit_order(order)
+                if bar.ts_event == b2u("2025-05-06 09:30:00"):
+                    order = self.order_factory.limit(self.inst.id, OrderSide.BUY, Quantity.from_int(100), Price.from_str("100.00"), TimeInForce.DAY)
+                    assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=100.0).is_valid
+                    self.submit_order(order)
+                elif bar.ts_event >= b2u("2025-05-06 15:00:00"):
+                    # 登记日收盘盯市：自动锁定登记日收盘持仓快照 (100 股) 作为合法分红权益基准 (V04)
+                    self.ledger.mark_to_market(d_str, {"600519": Decimal("100.00")})
 
             elif d_str == "2025-05-07":
                 if not self.split_applied:
                     self.gateway.on_trade_day_start(d_str)
                     self.ledger.on_trade_day_start(d_str)
+                    # 容错：若未在昨日收市盯市，在跨日除权前封存昨日登记日收盘快照 (V04)
+                    if self.ledger.last_valuation_date != "2025-05-06":
+                        self.ledger.mark_to_market("2025-05-06", {"600519": Decimal("100.00")})
+                    # 除权除息日处理：100 股确认 200 元应收分红，且送转拆股 1:1
                     self.ledger.process_corporate_actions_for_date(d_str)
                     self.gateway.apply_stock_split("600519", 2.0)
                     for pos in self.cache.positions_open():
                         self.bridge.apply_split(pos, 2.0, bar.ts_event, self.inst)
                     self.split_applied = True
+                    self.ledger.mark_to_market(d_str, {"600519": Decimal("50.00")})
 
             elif d_str == "2025-05-08":
                 self.gateway.on_trade_day_start(d_str)
                 self.ledger.on_trade_day_start(d_str)
+                # 派息日：200 元现金分红到账转入可用现金 (V04)
+                self.ledger.process_corporate_actions_for_date(d_str)
+                # 卖出全部 200 股 @ 50.00
                 order = self.order_factory.limit(self.inst.id, OrderSide.SELL, Quantity.from_int(200), Price.from_str("50.00"), TimeInForce.DAY)
                 assert self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=50.0).is_valid
                 self.submit_order(order)
+                self.ledger.mark_to_market(d_str, {"600519": Decimal("50.00")})
 
     cfg = BacktestEngineConfig(trader_id=TraderId("TRADER-001"), logging=LoggingConfig(log_level="ERROR"))
     eng = BacktestEngine(config=cfg)
@@ -423,6 +457,7 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
     bt = BarType(inst_id, BarSpecification(1, BarAggregation.HOUR, PriceType.LAST), AggregationSource.EXTERNAL)
     eng.add_data([
         Bar(bt, Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Quantity.from_int(10000), b2u("2025-05-06 09:30:00"), b2u("2025-05-06 09:30:00")),
+        Bar(bt, Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Price.from_str("100.00"), Quantity.from_int(10000), b2u("2025-05-06 15:00:00"), b2u("2025-05-06 15:00:00")),
         Bar(bt, Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Quantity.from_int(10000), b2u("2025-05-07 09:30:00"), b2u("2025-05-07 09:30:00")),
         Bar(bt, Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Price.from_str("50.00"), Quantity.from_int(10000), b2u("2025-05-08 09:30:00"), b2u("2025-05-08 09:30:00")),
     ])
@@ -435,4 +470,115 @@ def test_corporate_action_e2e_engine_split_and_reconciliation():
     # 黄金账本持仓归零
     assert strat.ledger.positions["600519"] == Decimal("0.0")
     assert strat.ledger.tradable_positions["600519"] == Decimal("0.0")
+    assert strat.gateway.get_total_position("600519") == Decimal("0.0")
     assert strat.ledger.lots["600519"] == []
+    # 核心分红断言 (V04)：登记日持有 100 股产生 200 元现金分红，派息日已全额入账！
+    assert strat.ledger.dividend_entitlements["600519_2025-05-07"] == Decimal("100.0")
+    assert strat.ledger.receivable_dividends == {}
+    # 现金对账：初始 100,000 - 买入 10,000 + 卖出 10,000 + 现金分红 200 = 100,200.0 元！
+    assert strat.ledger.cash == Decimal("100200.0")
+
+
+def test_gateway_and_ledger_split_allocation_parity_multi_lot():
+    """
+    【V03 验证】多批次持仓在非整数拆股比例下的网关与黄金账本分配一致性：
+    - 200 股持仓 (批次 1: 100 股已结算，批次 2: 100 股未结算)
+    - 拆股比例 1.005，理论账户总权益 200 * 1.005 = 201 股
+    - 验证网关与黄金账本均以发生时间优先原则补足舍入差额，两者总持仓严格等于 201 股，零漂移！
+    """
+    ledger = GoldenLedger(initial_cash=Decimal("100000.0"))
+    gateway = AShareOrderGateway()
+
+    # 批次 1: 5月5日买入 100 股 (已结算)
+    f1 = Fill(
+        fill_id="f-parity-1",
+        symbol="600519",
+        side=ContractOrderSide.BUY,
+        quantity=Decimal("100.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("0.0"),
+        timestamp=datetime(2025, 5, 5, 10, 0, 0),
+    )
+    ledger.apply_fill(f1, "2025-05-05")
+    gateway._settled_shares["600519"] = Decimal("100.0")
+
+    # 批次 2: 5月6日买入 100 股 (未结算)
+    f2 = Fill(
+        fill_id="f-parity-2",
+        symbol="600519",
+        side=ContractOrderSide.BUY,
+        quantity=Decimal("100.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("0.0"),
+        timestamp=datetime(2025, 5, 6, 10, 0, 0),
+    )
+    ledger.apply_fill(f2, "2025-05-06")
+    gateway._bought_lots["600519"] = [("2025-05-06", Decimal("100.0"))]
+
+    assert gateway.get_total_position("600519") == Decimal("200.0")
+    assert ledger.positions["600519"] == Decimal("200.0")
+
+    # 执行 1.005 比例拆股
+    split_ratio = Decimal("1.005")
+    ledger.apply_stock_split("600519", split_ratio, "2025-05-07")
+    gateway.apply_stock_split("600519", split_ratio)
+
+    # 核心断言：网关与账本均严格得到 201 股，绝不在网关丢失 1 股！
+    assert ledger.positions["600519"] == Decimal("201.0")
+    assert gateway.get_total_position("600519") == Decimal("201.0")
+    assert gateway.get_sellable_qty("600519") == Decimal("101.0")
+
+
+def test_golden_ledger_same_day_repeat_day_start_idempotency():
+    """
+    【V07 验证】黄金账本上市日重复调用 on_trade_day_start 具备严格幂等性：
+    - 100 股原仓送 100 股，5月12日上市
+    - 首次推进至 5月12日：可卖持仓释放为 200 股
+    - 同一交易日 (5月12日) 再次重复调用：可卖持仓严格保持 200 股，绝不回退至 100 股！
+    - 次日 (5月13日) 正常推进：可卖持仓保持 200 股
+    """
+    ledger = GoldenLedger(initial_cash=Decimal("100000.0"))
+    ledger.on_trade_day_start("2025-05-06")
+
+    fill = Fill(
+        fill_id="f-v07-1",
+        symbol="600519",
+        side=ContractOrderSide.BUY,
+        quantity=Decimal("100.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("0.0"),
+        timestamp=datetime(2025, 5, 6, 9, 30, 0),
+    )
+    ledger.apply_fill(fill, "2025-05-06")
+
+    # 注册 10 送 10，除权日 2025-05-08，上市日 2025-05-12
+    ca = CorporateAction(
+        symbol="600519",
+        record_date=date(2025, 5, 7),
+        ex_date=date(2025, 5, 8),
+        share_listing_date=date(2025, 5, 12),
+        bonus_ratio=Decimal("1.0"),
+    )
+    ledger.register_corporate_action(ca)
+
+    ledger.on_trade_day_start("2025-05-07")
+    ledger.mark_to_market("2025-05-07", {"600519": Decimal("100.0")})
+
+    ledger.on_trade_day_start("2025-05-08")
+    ledger.process_corporate_actions_for_date("2025-05-08")
+
+    # 5月8日总持仓 200 股，可卖仅 100 股
+    assert ledger.positions["600519"] == Decimal("200.0")
+    assert ledger.tradable_positions["600519"] == Decimal("100.0")
+
+    # 首次推进至上市日 2025-05-12
+    ledger.on_trade_day_start("2025-05-12")
+    assert ledger.tradable_positions["600519"] == Decimal("200.0")
+
+    # 同日 (2025-05-12) 重复调用日切，严格保持 200 股可卖持仓！
+    ledger.on_trade_day_start("2025-05-12")
+    assert ledger.tradable_positions["600519"] == Decimal("200.0")
+
+    # 次日推进至 2025-05-13
+    ledger.on_trade_day_start("2025-05-13")
+    assert ledger.tradable_positions["600519"] == Decimal("200.0")

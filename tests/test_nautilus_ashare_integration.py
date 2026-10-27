@@ -11,6 +11,7 @@
 """
 
 import pytest
+from typing import Optional
 from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -89,6 +90,8 @@ class AShareTestStrategy(Strategy):
         self.price_collar_rejections = 0
         self.successful_buys = 0
         self.successful_sells = 0
+        self.denied_callbacks_count = 0
+        self.canceled_callbacks_count = 0
 
     def on_start(self):
         self.subscribe_bars(self.bar_type)
@@ -122,7 +125,8 @@ class AShareTestStrategy(Strategy):
             self.successful_sells += 1
 
     def on_order_canceled(self, event):
-        """原生 CANCELED 回调：释放网关挂单预留 (N02)"""
+        """原生 CANCELED 回调：释放网关挂单预留 (N02, V08)"""
+        self.canceled_callbacks_count += 1
         self.gateway.on_order_canceled(str(event.client_order_id), str(self.instrument_id.symbol))
 
     def on_order_rejected(self, event):
@@ -134,13 +138,14 @@ class AShareTestStrategy(Strategy):
         self.gateway.on_order_expired(str(event.client_order_id), str(self.instrument_id.symbol))
 
     def on_order_denied(self, event):
-        """原生 DENIED 回调：释放网关挂单预留 (Q05)"""
+        """原生 DENIED 回调：释放网关挂单预留 (Q05, V08)"""
+        self.denied_callbacks_count += 1
         sym = str(event.instrument_id.symbol) if hasattr(event, "instrument_id") else str(self.instrument_id.symbol)
         self.gateway.on_order_denied(str(event.client_order_id), sym)
 
-    def _on_session_close(self, event: TimeEvent):
+    def _on_session_close(self, event: Optional[TimeEvent] = None):
         """
-        【Q01 修复】15:00:00 交易日收市事件：
+        【Q01, V01 修复】15:00:00 交易日收市事件：
         1. 真实撤销当日所有未成交挂单，杜绝跨日撮合
         2. 释放网关活动订单预留
         3. 封存当日最终日终 NAV 估值快照，彻底阻断次日开盘撮合对前一日 NAV 的时序污染
@@ -167,18 +172,10 @@ class AShareTestStrategy(Strategy):
         trade_date = dt.strftime("%Y-%m-%d")
         symbol_str = str(self.instrument_id.symbol)
         px = bar.close.as_double()
-        self.last_close_px = px
 
-        # 注册 15:00:00 会话收市警报 (Q01)
-        close_timer_name = f"session_close_{trade_date}"
-        if close_timer_name not in self.clock.timer_names:
-            close_ns = beijing_to_utc_ns(f"{trade_date} 15:00:00")
-            if close_ns > bar.ts_event:
-                self.clock.set_time_alert_ns(close_timer_name, close_ns, callback=self._on_session_close)
-
-        # 跨日时钟推进：日终结算，今日买入自动释放为次日可卖 (T+1 状态流转)
+        # 跨日时钟推进：日终结算，今日买入自动释放为次日可卖 (T+1 状态流转, V01 顺序修正)
         if self.current_date is not None and trade_date != self.current_date:
-            # 容错：若之前未触发收市，兜底封存前一日 NAV
+            # 容错：若之前未触发收市，使用前一日收盘价 (self.last_close_px) 兜底封存前一日 NAV (V01)
             if self.ledger.last_valuation_date != self.current_date and self.last_close_px is not None:
                 self.ledger.mark_to_market(self.current_date, {symbol_str: Decimal(str(self.last_close_px))})
 
@@ -193,6 +190,22 @@ class AShareTestStrategy(Strategy):
         if self.current_date is None:
             self.gateway.on_trade_day_start(trade_date)
             self.ledger.on_trade_day_start(trade_date)
+
+        self.current_date = trade_date
+        # 仅在跨日判定完成后更新当日收盘价 (V01)
+        self.last_close_px = px
+
+        # 注册 15:00:00 会话收市警报 (Q01, V01)
+        close_timer_name = f"session_close_{trade_date}"
+        close_ns = beijing_to_utc_ns(f"{trade_date} 15:00:00")
+        if close_timer_name not in self.clock.timer_names:
+            if close_ns > bar.ts_event:
+                self.clock.set_time_alert_ns(close_timer_name, close_ns, callback=self._on_session_close)
+
+        # 若当前 Bar 时间戳已到达或超过 15:00:00 (如日线输入或尾盘收盘 Bar)，即刻触发收市闭环 (V01)
+        if bar.ts_event >= close_ns:
+            self._on_session_close()
+            return
 
         self.current_date = trade_date
 
@@ -1120,5 +1133,313 @@ def test_day_order_unfilled_expires_at_session_close_nav_uncontaminated():
     assert len(strat.ledger.history) >= 1
     nav_day1 = strat.ledger.history[0]
     assert str(nav_day1.date) == "2025-05-06"
+    assert nav_day1.cash == Decimal("1000000.0")
+    assert nav_day1.total_equity == Decimal("1000000.0")
+
+
+def test_closing_auction_phase_bypasses_price_collar():
+    """
+    【V05 验证】2% 价格笼子按交易阶段精细区分：
+    - 连续竞价阶段 (CONTINUOUS): 买入 109.00 对基准 100.00 超过 +2% 限制，必须被严格拦截！
+    - 收盘集合竞价 (CLOSING_AUCTION): 主板涨跌停区间 [90, 110]，买入 109.00 合法合规，价格笼子放行！
+    """
+    from nautilus_trader.model.orders import LimitOrder
+    from nautilus_trader.core.uuid import UUID4
+
+    inst_id = InstrumentId(Symbol("000001"), Venue("SZSE"))
+    gateway = AShareOrderGateway()
+    order = LimitOrder(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("STRAT-001"),
+        instrument_id=inst_id,
+        client_order_id=ClientOrderId("BUY-COLLAR-1"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(100),
+        price=Price.from_str("109.00"),
+        time_in_force=TimeInForce.DAY,
+        init_id=UUID4(),
+        ts_init=0,
+    )
+    bar_dict = {"close": 100.0, "volume": 10000}
+
+    # 1. 连续竞价阶段：拦截
+    continuous_rule = {
+        "trade_status": "OPEN",
+        "session_phase": "CONTINUOUS",
+        "limit_state": "BOUNDED",
+        "up_limit": 110.0,
+        "down_limit": 90.0,
+        "buy_min": 100,
+        "buy_step": 100,
+    }
+    res_cont = gateway.validate_and_reserve(order, continuous_rule, bar_dict, benchmark_price=100.0)
+    assert not res_cont.is_valid
+    assert "PRICE_COLLAR_VIOLATION" in res_cont.rejection_reason
+
+    # 2. 集合竞价阶段 (CLOSING_AUCTION): 价格在 [90, 110] 范围内部，价格笼子不适用，必须合法通过！
+    auction_rule = {
+        "trade_status": "OPEN",
+        "session_phase": "CLOSING_AUCTION",
+        "limit_state": "BOUNDED",
+        "up_limit": 110.0,
+        "down_limit": 90.0,
+        "buy_min": 100,
+        "buy_step": 100,
+    }
+    res_auc = gateway.validate_and_reserve(order, auction_rule, bar_dict, benchmark_price=100.0)
+    assert res_auc.is_valid, f"Closing auction should bypass 2% collar, but got: {res_auc.rejection_reason}"
+
+
+def test_gateway_atomic_deduplication_and_identity_validation():
+    """
+    【V06 验证】网关成交处理原子性与标的/方向身份契约校验：
+    1. 校验失败时绝不污染 _processed_trade_ids 去重集合，纠正后重试可正常计入。
+    2. 成交回报的证券代码必须与申报严格一致，否则抛出异常阻断。
+    3. 成交回报的买卖方向必须与申报严格一致，否则抛出异常阻断。
+    """
+    from nautilus_trader.model.orders import LimitOrder
+    from nautilus_trader.core.uuid import UUID4
+
+    gateway = AShareOrderGateway()
+    inst_600519 = InstrumentId(Symbol("600519"), Venue("SSE"))
+    inst_000001 = InstrumentId(Symbol("000001"), Venue("SZSE"))
+
+    # 登记 600519.SSE 买单 100 股
+    order = LimitOrder(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("STRAT-001"),
+        instrument_id=inst_600519,
+        client_order_id=ClientOrderId("BUY-ATOMIC-1"),
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(100),
+        price=Price.from_str("100.00"),
+        time_in_force=TimeInForce.DAY,
+        init_id=UUID4(),
+        ts_init=0,
+    )
+    rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100}
+    bar = {"close": 100.0, "volume": 1000}
+    assert gateway.validate_and_reserve(order, rule, bar, benchmark_price=100.0).is_valid
+
+    # 1. 证券标的不匹配 (申报 600519，回报 000001)
+    class MismatchInstFillEvent:
+        trade_id = "TRADE_MISMATCH_INST"
+        client_order_id = order.client_order_id
+        instrument_id = inst_000001
+        order_side = OrderSide.BUY
+        last_qty = Quantity.from_int(100)
+        last_px = Price.from_str("100.00")
+        commission = Money(0.0, CNY)
+        ts_event = beijing_to_utc_ns("2025-05-06 10:00:00")
+
+    with pytest.raises(RuntimeError, match="Instrument symbol mismatch"):
+        gateway.on_order_filled(MismatchInstFillEvent())
+
+    # 2. 买卖方向不匹配 (申报 BUY，回报 SELL)
+    class MismatchSideFillEvent:
+        trade_id = "TRADE_MISMATCH_SIDE"
+        client_order_id = order.client_order_id
+        instrument_id = inst_600519
+        order_side = OrderSide.SELL
+        last_qty = Quantity.from_int(100)
+        last_px = Price.from_str("100.00")
+        commission = Money(0.0, CNY)
+        ts_event = beijing_to_utc_ns("2025-05-06 10:00:00")
+
+    with pytest.raises(RuntimeError, match="Order side mismatch"):
+        gateway.on_order_filled(MismatchSideFillEvent())
+
+    # 3. 超量成交拒绝后不污染去重 ID，纠正后重试可成功入账
+    class OverfillEvent:
+        trade_id = "TRADE_ATOMIC_RETRY"
+        client_order_id = order.client_order_id
+        instrument_id = inst_600519
+        order_side = OrderSide.BUY
+        last_qty = Quantity.from_int(200)
+        last_px = Price.from_str("100.00")
+        commission = Money(0.0, CNY)
+        ts_event = beijing_to_utc_ns("2025-05-06 10:00:00")
+
+    with pytest.raises(RuntimeError, match="exceeds declared order quantity"):
+        gateway.on_order_filled(OverfillEvent())
+
+    assert "TRADE_ATOMIC_RETRY" not in gateway._processed_trade_ids
+
+    class CorrectedFillEvent:
+        trade_id = "TRADE_ATOMIC_RETRY"
+        client_order_id = order.client_order_id
+        instrument_id = inst_600519
+        order_side = OrderSide.BUY
+        last_qty = Quantity.from_int(100)
+        last_px = Price.from_str("100.00")
+        commission = Money(0.0, CNY)
+        ts_event = beijing_to_utc_ns("2025-05-06 10:00:00")
+
+    fill_d = gateway.on_order_filled(CorrectedFillEvent())
+    assert fill_d == "2025-05-06"
+    assert "TRADE_ATOMIC_RETRY" in gateway._processed_trade_ids
+    assert gateway.get_total_position("600519") == Decimal("100")
+
+
+def test_formal_strategy_denied_and_canceled_native_callbacks():
+    """
+    【V08 验证】由真实 BacktestEngine 驱动 AShareTestStrategy 的原生终态事件：
+    - 资金不足导致原生 OrderDenied -> AShareTestStrategy.on_order_denied 清除网关活动订单
+    - 限价单提交后撤单导致原生 OrderCanceled -> AShareTestStrategy.on_order_canceled 释放网关活动订单及预留
+    对策略方法进行变异敏感性保护，杜绝未接线漏洞。
+    """
+    venue_sse = Venue("SSE")
+    symbol = Symbol("600519")
+    inst_id = InstrumentId(symbol, venue_sse)
+
+    cfg = BacktestEngineConfig(trader_id=TraderId("TRADER-001"), logging=LoggingConfig(log_level="ERROR"))
+    eng = BacktestEngine(config=cfg)
+    eng.add_venue(venue=venue_sse, oms_type=OmsType.NETTING, account_type=AccountType.CASH, base_currency=CNY, starting_balances=[Money(10000.0, CNY)])
+    t0 = beijing_to_utc_ns("2025-05-01 09:30:00")
+    inst = Equity(instrument_id=inst_id, raw_symbol=symbol, currency=CNY, price_precision=2, price_increment=Price.from_str("0.01"), lot_size=Quantity.from_int(100), ts_event=t0, ts_init=t0)
+    eng.add_instrument(inst)
+    bt = BarType(inst_id, BarSpecification(1, BarAggregation.HOUR, PriceType.LAST), AggregationSource.EXTERNAL)
+
+    class NativeCallbackStrategy(AShareTestStrategy):
+        def __init__(self, config: AShareTestStrategyConfig):
+            super().__init__(config)
+            self.step = 0
+
+        def on_bar(self, bar: Bar):
+            dt = datetime.fromtimestamp(bar.ts_event / 1e9, tz=SHANGHAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+            self.current_date = d_str
+            self.gateway.on_trade_day_start(d_str)
+
+            if self.step == 0:
+                # 申报 2000 股 @ 100.00 = 200,000 元 (资金仅 10,000 元)，必被原生 DENIED
+                order_denied = self.order_factory.limit(
+                    instrument_id=self.instrument_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(2000),
+                    price=Price.from_str("100.00"),
+                    time_in_force=TimeInForce.DAY,
+                )
+                rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100, "max_order": 1000000}
+                bar_dict = {"close": 100.0, "volume": 10000}
+                res = self.gateway.validate_and_reserve(order_denied, rule, bar_dict, benchmark_price=100.0)
+                assert res.is_valid
+                self.submit_order(order_denied)
+                self.step = 1
+            elif self.step == 1:
+                # 申报挂单并撤单，验证原生 CANCELED
+                order_cancel = self.order_factory.limit(
+                    instrument_id=self.instrument_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(100),
+                    price=Price.from_str("50.00"),
+                    time_in_force=TimeInForce.DAY,
+                )
+                rule = {"trade_status": "OPEN", "limit_state": "UNBOUNDED", "buy_min": 100, "buy_step": 100, "max_order": 1000000}
+                bar_dict = {"close": 100.0, "volume": 10000}
+                res = self.gateway.validate_and_reserve(order_cancel, rule, bar_dict, benchmark_price=50.0)
+                assert res.is_valid
+                self.submit_order(order_cancel)
+                self.cancel_order(order_cancel)
+                self.step = 2
+
+    eng.add_data([
+        Bar(bt, Price.from_str("100.00"), Price.from_str("100.50"), Price.from_str("99.50"), Price.from_str("100.00"), Quantity.from_int(10000), beijing_to_utc_ns("2025-05-06 09:30:00"), beijing_to_utc_ns("2025-05-06 09:30:00")),
+        Bar(bt, Price.from_str("100.00"), Price.from_str("100.50"), Price.from_str("99.50"), Price.from_str("100.00"), Quantity.from_int(10000), beijing_to_utc_ns("2025-05-06 14:00:00"), beijing_to_utc_ns("2025-05-06 14:00:00")),
+    ])
+    strat = NativeCallbackStrategy(AShareTestStrategyConfig(instrument_id=inst_id, bar_type=bt))
+    eng.add_strategy(strat)
+    eng.run()
+
+    assert strat.denied_callbacks_count >= 1, "原生 OrderDenied 回调未被策略消费！"
+    assert strat.canceled_callbacks_count >= 1, "原生 OrderCanceled 回调未被策略消费！"
+    assert len(strat.gateway._active_orders) == 0, "终态后网关仍残留活动订单！"
+
+
+def test_daily_bar_at_1500_session_close_and_eod_nav_purity():
+    """
+    【V01 验证】针对 BarAggregation.DAY (时戳为 15:00:00) 的会话闭环与收市到期：
+    - Day 1 15:00:00 输入未成交的限价 DAY 买单 (Bar 最低 99.50，限价 99.00)
+    - 策略在 15:00:00 Bar 触发收市闭环，真实撤单并封存 Day 1 NAV 快照
+    - Day 2 15:00:00 (Bar 最低 98.00) 绝不发生跨日撮合成交
+    - Day 1 NAV 严格保持 0 股持仓、初始现金 1,000,000 元，净值完全未受次日行情与虚假成交污染
+    """
+    venue_sse = Venue("SSE")
+    symbol = Symbol("600519")
+    inst_id = InstrumentId(symbol, venue_sse)
+
+    cfg = BacktestEngineConfig(trader_id=TraderId("TRADER-001"), logging=LoggingConfig(log_level="ERROR"))
+    eng = BacktestEngine(config=cfg)
+    eng.add_venue(venue=venue_sse, oms_type=OmsType.NETTING, account_type=AccountType.CASH, base_currency=CNY, starting_balances=[Money(1000000.0, CNY)])
+    t0 = beijing_to_utc_ns("2025-05-01 09:30:00")
+    inst = Equity(instrument_id=inst_id, raw_symbol=symbol, currency=CNY, price_precision=2, price_increment=Price.from_str("0.01"), lot_size=Quantity.from_int(100), ts_event=t0, ts_init=t0)
+    eng.add_instrument(inst)
+    bt = BarType(inst_id, BarSpecification(1, BarAggregation.DAY, PriceType.LAST), AggregationSource.EXTERNAL)
+
+    class DailyBarTestStrategy(AShareTestStrategy):
+        def __init__(self, config: AShareTestStrategyConfig):
+            super().__init__(config)
+            self.day2_matched = False
+
+        def on_order_filled(self, event):
+            super().on_order_filled(event)
+            dt = datetime.fromtimestamp(event.ts_event / 1e9, tz=SHANGHAI_TZ)
+            if dt.strftime("%Y-%m-%d") == "2025-05-07":
+                self.day2_matched = True
+
+        def on_bar(self, bar: Bar):
+            dt = datetime.fromtimestamp(bar.ts_event / 1e9, tz=SHANGHAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+
+            if self.current_date is not None and d_str != self.current_date:
+                if self.ledger.last_valuation_date != self.current_date and self.last_close_px is not None:
+                    self.ledger.mark_to_market(self.current_date, {str(self.instrument_id.symbol): Decimal(str(self.last_close_px))})
+                self.cancel_all_orders(self.instrument_id)
+                self.gateway.on_session_close()
+                self.gateway.on_trade_day_start(d_str)
+                self.ledger.on_trade_day_start(d_str)
+
+            if self.current_date is None:
+                self.gateway.on_trade_day_start(d_str)
+                self.ledger.on_trade_day_start(d_str)
+
+            self.current_date = d_str
+            self.last_close_px = bar.close.as_double()
+
+            # Day 1: 提交无法成交的 DAY 买单 @ 99.00
+            if d_str == "2025-05-06":
+                order = self.order_factory.limit(
+                    instrument_id=self.instrument_id,
+                    order_side=OrderSide.BUY,
+                    quantity=Quantity.from_int(200),
+                    price=Price.from_str("99.00"),
+                    time_in_force=TimeInForce.DAY,
+                )
+                rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100, "max_order": 1000000}
+                bar_dict = {"close": bar.close.as_double(), "volume": bar.volume.as_double()}
+                res = self.gateway.validate_and_reserve(order, rule, bar_dict, benchmark_price=100.0)
+                if res.is_valid:
+                    self.submit_order(order)
+
+            # 15:00:00 结束时触发收市清理
+            close_ns = beijing_to_utc_ns(f"{d_str} 15:00:00")
+            if bar.ts_event >= close_ns:
+                self._on_session_close()
+
+    eng.add_data([
+        Bar(bt, Price.from_str("100.00"), Price.from_str("100.50"), Price.from_str("99.50"), Price.from_str("100.00"), Quantity.from_int(10000), beijing_to_utc_ns("2025-05-06 15:00:00"), beijing_to_utc_ns("2025-05-06 15:00:00")),
+        Bar(bt, Price.from_str("98.00"), Price.from_str("105.00"), Price.from_str("98.00"), Price.from_str("105.00"), Quantity.from_int(10000), beijing_to_utc_ns("2025-05-07 15:00:00"), beijing_to_utc_ns("2025-05-07 15:00:00")),
+    ])
+    strat = DailyBarTestStrategy(AShareTestStrategyConfig(instrument_id=inst_id, bar_type=bt))
+    eng.add_strategy(strat)
+    eng.run()
+
+    assert not strat.day2_matched, "Day 1 未成交限价单严禁在 Day 2 撮合成交！"
+    assert float(eng.portfolio.net_position(inst_id)) == 0.0
+
+    assert len(strat.ledger.history) >= 1
+    nav_day1 = strat.ledger.history[0]
+    assert str(nav_day1.date) == "2025-05-06"
+    assert nav_day1.holdings.get("600519", Decimal("0")) == Decimal("0")
     assert nav_day1.cash == Decimal("1000000.0")
     assert nav_day1.total_equity == Decimal("1000000.0")

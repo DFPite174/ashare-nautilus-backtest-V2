@@ -40,11 +40,26 @@ class GoldenLedger:
         self.pending_listing_shares: List[Tuple[date, str, Decimal]] = [] # [(listing_date, symbol, qty)]
         self.processed_action_ids: Set[str] = set()
 
+        # 当前推进交易日 (V07)
+        self._current_trade_date: Optional[str] = None
+
     def on_trade_day_start(self, trade_date: str) -> None:
         """
         交易日开始：推进 T+1 时钟，将之前买入的股份转为可卖状态，并解冻满足上市日的新增送转股份 (N06)
+        具备严格的单调时序与幂等性保护 (V07)：同一交易日重复调用绝不重新冻结已上市股份。
         """
         cur_d = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
+
+        # 单调时序与重复调用幂等性校验 (V07)
+        if self._current_trade_date is not None:
+            if str(trade_date) < self._current_trade_date:
+                raise ValueError(
+                    f"Trade date regression detected: received {trade_date} which precedes current {self._current_trade_date}"
+                )
+            if str(trade_date) == self._current_trade_date:
+                return
+
+        self._current_trade_date = str(trade_date)
 
         # 1. 推进常规 T+1 买入股份结转
         for sym, lot_list in self.lots.items():
@@ -168,17 +183,23 @@ class GoldenLedger:
         trade_date: str,
         share_listing_date: Optional[date] = None,
         fractional_policy: str = "floor",
+        fractional_cash_price: Optional[Decimal] = None,
     ) -> None:
         """
-        【N06, N09, Q07】处理股票拆细 / 送转股：
-        保持持仓总市值不变，支持可配置的零碎股处理策略 (fractional_policy):
+        【N06, N09, Q07, V02】处理股票拆细 / 送转股：
+        保持持仓总市值不变，支持严格可配置的零碎股处理策略 (fractional_policy):
         - 'floor': 向下取整保留整数股 (ROUND_FLOOR，默认)，保证批次与总持仓严格守恒。
         - 'reject': 若存在零碎股则严格拒绝并抛出异常。
-        - 'cash_in_lieu': 零碎部分按当前估值价格折算为现金补足入账。
+        - 'cash_in_lieu': 零碎部分按除权基准价（或指定折算价）折算为现金补足入账，严禁使用虚构价格或旧单位价格。
         """
         split_ratio = Decimal(str(split_ratio))
         if split_ratio <= Decimal("0.0"):
             raise ValueError(f"Split ratio must be positive, got {split_ratio}")
+
+        if fractional_policy not in ("floor", "reject", "cash_in_lieu"):
+            raise ValueError(
+                f"Invalid fractional_policy '{fractional_policy}', must be one of 'floor', 'reject', 'cash_in_lieu'"
+            )
 
         cur_d = date.fromisoformat(trade_date) if isinstance(trade_date, str) else trade_date
         orig_held = self.positions.get(symbol, Decimal("0.0"))
@@ -194,9 +215,17 @@ class GoldenLedger:
                 f"Fractional share detected under reject policy for {symbol}: held {orig_held} * ratio {split_ratio} = {raw_new_held}"
             )
         elif fractional_policy == "cash_in_lieu" and frac > Decimal("0.0"):
-            px = Decimal("1.0")
-            if symbol in self.latest_prices:
-                px = self.latest_prices[symbol][0]
+            # 零碎部分折现 (V02)：严禁虚构价格，严禁直接使用未经除权调整的旧单位价格
+            if fractional_cash_price is not None:
+                px = Decimal(str(fractional_cash_price))
+            elif symbol in self.latest_prices:
+                pre_split_px, _ = self.latest_prices[symbol]
+                # 除权基准参考价 = 拆前价格 / 拆分比例 (新单位公允价格)
+                px = (pre_split_px / split_ratio).quantize(Decimal("0.0001"))
+            else:
+                raise ValueError(
+                    f"Missing valid valuation price for cash_in_lieu calculation on {symbol}"
+                )
             cash_comp = (frac * px).quantize(Decimal("0.01"))
             self.cash += cash_comp
             new_total_held = floored_held
@@ -278,6 +307,7 @@ class GoldenLedger:
                         current_date_str,
                         share_listing_date=action.share_listing_date,
                         fractional_policy=action.fractional_policy,
+                        fractional_cash_price=action.fractional_cash_price,
                     )
                     self.processed_action_ids.add(f"{act_id}_split")
 
@@ -350,6 +380,12 @@ class GoldenLedger:
         # 4. 计算当前应收分红 (N07)
         total_receivable = sum(self.receivable_dividends.values(), Decimal("0.0"))
         total_equity = self.cash + pos_val + total_receivable
+
+        # 5. 自动同步当日收盘对应的股权登记日快照 (V04: 锁定登记日收盘持仓作为唯一合法权益基准)
+        for action in self.pending_corporate_actions:
+            if action.record_date and str(action.record_date) == trade_date_str:
+                act_id = f"{action.symbol}_{action.ex_date}"
+                self.dividend_entitlements[act_id] = self.positions.get(action.symbol, Decimal("0.0"))
 
         nav = DailyNAV(
             date=trade_date_str,
