@@ -4,7 +4,7 @@ A 股交易制度与市场约束规则引擎 (Market Rules Engine)
 1. 板块差异化涨跌停限制 (主板/创业板/科创板/北交所/ST/新股/退市整理期)
 2. T+1 可卖数量与状态流转
 3. 停牌、无行情与挂单撤销处理
-4. 退市标的清算与折价估值
+4. 退市与长停标的资产减值评估 (非虚拟现金变现)
 5. 交易手数规整与零股一次性清仓
 6. 2% 申报价格笼子机制 (全面注册制)
 7. TradingState (Active / Reducing / Halted) 映射联动
@@ -15,7 +15,15 @@ from __future__ import annotations
 import math
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Set
+
+
+KNOWN_BOARDS: Set[str] = {
+    "MAIN", "主板",
+    "CYB", "创业板",
+    "KCB", "科创板",
+    "BSE", "北交所",
+}
 
 
 @dataclass(frozen=True)
@@ -39,38 +47,63 @@ def calculate_price_limits(
     days_since_ipo: int = 100,
     is_delisting: bool = False,
     delisting_day: int = 1,
+    rule_date: Optional[str] = None,
 ) -> Tuple[Optional[float], Optional[float], str]:
     """
     【Item 1】板块差异化涨跌停价格计算与校验规则
     :param prev_close: 前收盘价
     :param board: 交易板块 ('MAIN'/'主板', 'CYB'/'创业板', 'KCB'/'科创板', 'BSE'/'北交所')
     :param is_st: 是否为 ST/*ST 风险警示股票
-    :param days_since_ipo: 上市以来的交易日数 (新股前5日无涨跌幅)
+    :param days_since_ipo: 上市以来的交易日数 (新股)
     :param is_delisting: 是否处于退市整理期
     :param delisting_day: 退市整理期第几日 (首日无涨跌幅)
+    :param rule_date: 规则适用日期 (YYYY-MM-DD)，用于历史规则分水岭 (如2026年7月主板ST调整)
     :return: (涨停价 up_limit, 跌停价 down_limit, 状态 limit_state)
     """
     if prev_close <= 0:
         return (None, None, "UNAVAILABLE")
 
-    # 1. 新股上市前 5 个交易日：无涨跌幅限制
-    if days_since_ipo <= 5:
-        return (None, None, "UNBOUNDED")
+    board_clean = board.upper()
+    if board_clean not in KNOWN_BOARDS and board not in KNOWN_BOARDS:
+        raise ValueError(f"Unknown trading board: '{board}'. Known boards: {KNOWN_BOARDS}")
+
+    is_bse = board_clean in ("BSE", "北交所")
+    is_cyb = board_clean in ("CYB", "创业板")
+    is_kcb = board_clean in ("KCB", "科创板")
+    is_main = board_clean in ("MAIN", "主板")
+
+    # 1. 新股上市无涨跌幅限制判断：
+    # - 北交所 (BSE)：仅上市首日 (days_since_ipo <= 1) 无涨跌幅限制，次日起实施 ±30% 涨跌幅限制
+    # - 主板 / 创业板 / 科创板：上市前 5 个交易日 (days_since_ipo <= 5) 无涨跌幅限制
+    if is_bse:
+        if days_since_ipo <= 1:
+            return (None, None, "UNBOUNDED")
+    else:
+        if days_since_ipo <= 5:
+            return (None, None, "UNBOUNDED")
 
     # 2. 退市整理期首日：无涨跌幅限制
     if is_delisting and delisting_day == 1:
         return (None, None, "UNBOUNDED")
 
-    # 3. 板块与 ST 差异化涨跌幅比例判定
-    board_clean = board.upper()
-    if is_st:
-        pct = 0.05  # 主板 ST 为 5%
-    elif board_clean in ("CYB", "创业板", "KCB", "科创板"):
-        pct = 0.20  # 创业板/科创板 20%
-    elif board_clean in ("BSE", "北交所"):
-        pct = 0.30  # 北交所 30%
+    # 3. 板块与 ST 差异化涨跌幅比例判定：
+    # - 创业板 / 科创板：常规与 ST/*ST 风险警示股票涨跌幅均为 ±20%
+    # - 北交所：常规与 ST/*ST 均为 ±30%
+    # - 沪深主板：常规为 ±10%；ST/*ST 标的在 2026-07 调整前为 ±5%，调整后为 ±10%
+    if is_cyb or is_kcb:
+        pct = 0.20
+    elif is_bse:
+        pct = 0.30
+    elif is_main:
+        if is_st:
+            if rule_date and rule_date >= "2026-07-01":
+                pct = 0.10
+            else:
+                pct = 0.05
+        else:
+            pct = 0.10
     else:
-        pct = 0.10  # 沪深主板常规 10%
+        pct = 0.10
 
     # 价格精确四舍五入到分 (A 股法定 0.01 元变动价位，采用标准四舍五入 ROUND_HALF_UP)
     d_close = Decimal(str(prev_close))
@@ -132,21 +165,26 @@ def handle_delisting_valuation(
     haircut: float = 0.50,
 ) -> Dict[str, Any]:
     """
-    【Item 4】退市持仓处理：持仓超过一定天数无行情时的清算或折价评估
+    【Item 4】退市持仓与长期无行情资产估值评估
+    严谨财务逻辑：对长期缺失流动性的资产计提减值准备（Haircut），不凭空产生现金变现
     """
     if days_no_quote >= forced_liquidation_days:
-        # 强制强制清算：残值清算或按折扣计提
-        cleared_value = round(held_shares * last_price * (1.0 - haircut), 2)
+        assessed_value = round(held_shares * last_price * (1.0 - haircut), 2)
+        valuation_loss = round(held_shares * last_price * haircut, 2)
         return {
-            "action": "FORCE_LIQUIDATE",
-            "cash_recovered": cleared_value,
+            "action": "HAIRCUT_VALUATION",
+            "assessed_market_value": assessed_value,
+            "valuation_loss": valuation_loss,
             "haircut_applied": haircut,
+            "is_cash_realized": False,  # 强调：估值计提不产生可用现金流入
             "reason": f"No quote for {days_no_quote} trading days",
         }
     return {
         "action": "HOLD",
-        "cash_recovered": 0.0,
+        "assessed_market_value": round(held_shares * last_price, 2),
+        "valuation_loss": 0.0,
         "haircut_applied": 0.0,
+        "is_cash_realized": False,
         "reason": "Within normal holding threshold",
     }
 
@@ -171,8 +209,14 @@ def block_reason(
     if bar.get("volume", 0) <= 0:
         return "ZERO_VOLUME"
 
-    if rule.get("limit_state") == "BOUNDED":
-        lo, hi = rule["down_limit"], rule["up_limit"]
+    limit_state = rule.get("limit_state")
+    if limit_state == "UNAVAILABLE":
+        return "PRICE_BAND_UNAVAILABLE"
+
+    if limit_state == "BOUNDED":
+        lo, hi = rule.get("down_limit"), rule.get("up_limit")
+        if lo is None or hi is None:
+            return "PRICE_BAND_UNAVAILABLE"
         close_p = bar.get("close", 0.0)
         # 日线收盘执行：保守策略在涨停日拒绝买单，跌停日拒绝卖单
         if side.lower() == "buy" and close_p >= hi - 1e-8:

@@ -6,7 +6,7 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![NautilusTrader 1.231.0](https://img.shields.io/badge/NautilusTrader-1.231.0-brightgreen.svg)](https://nautilustrader.io/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-22%20passed-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-25%20passed-brightgreen.svg)]()
 
 ---
 
@@ -104,7 +104,7 @@ pytest tests/ -v
 
 **预期输出**：
 ```text
-======================= 22 passed, 4 warnings in 1.58s ========================
+======================= 25 passed, 6 warnings in 1.33s ========================
 ```
 
 ---

@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.pyd binary
+*.pyx text eol=lf
+*.pxd text eol=lf

@@ -8,7 +8,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+from types import MappingProxyType
 
 
 class AssetClass(str, Enum):
@@ -105,6 +106,15 @@ class TargetWeights(BaseModel):
     strategy_id: str = Field(default="default_strategy")
     params_hash: str = Field(default="")
 
+    @model_validator(mode="after")
+    def validate_target_weights(self) -> "TargetWeights":
+        if self.execution_date < self.signal_date:
+            raise ValueError(f"execution_date ({self.execution_date}) cannot precede signal_date ({self.signal_date})")
+        total_w = sum(self.weights.values())
+        if total_w > 1.000001:
+            raise ValueError(f"Total target weights sum to {total_w:.4f}, exceeding 1.0 limit")
+        return self
+
 
 class Fill(BaseModel):
     """成交明细记录"""
@@ -117,6 +127,16 @@ class Fill(BaseModel):
     price: Decimal
     fee: Decimal
     timestamp: datetime
+
+    @model_validator(mode="after")
+    def validate_fill(self) -> "Fill":
+        if self.quantity <= Decimal("0.0"):
+            raise ValueError(f"Fill quantity must be positive, got {self.quantity}")
+        if self.price <= Decimal("0.0"):
+            raise ValueError(f"Fill price must be positive, got {self.price}")
+        if self.fee < Decimal("0.0"):
+            raise ValueError(f"Fill fee cannot be negative, got {self.fee}")
+        return self
 
 
 class DailyNAV(BaseModel):

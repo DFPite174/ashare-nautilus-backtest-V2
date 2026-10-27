@@ -54,25 +54,38 @@ def test_item1_board_differentiated_price_limits():
     assert down_st == 9.50
     assert state_st == "BOUNDED"
 
-    # 3. 创业板 (CYB)：±20% -> [8.00, 12.00]
+    # 2.1 主板 ST 在 2026-07 规则调整后：实施 ±10% 涨跌幅
+    up_st_2026, down_st_2026, _ = calculate_price_limits(prev_close, board="MAIN", is_st=True, rule_date="2026-07-02")
+    assert up_st_2026 == 11.00
+    assert down_st_2026 == 9.00
+
+    # 3. 创业板 (CYB)：常规与 ST 均为 ±20% -> [8.00, 12.00]
     up_cyb, down_cyb, state_cyb = calculate_price_limits(prev_close, board="CYB")
     assert up_cyb == 12.00
     assert down_cyb == 8.00
     assert state_cyb == "BOUNDED"
+    up_cyb_st, down_cyb_st, _ = calculate_price_limits(prev_close, board="CYB", is_st=True)
+    assert up_cyb_st == 12.00
+    assert down_cyb_st == 8.00
 
-    # 4. 科创板 (KCB)：±20% -> [8.00, 12.00]
+    # 4. 科创板 (KCB)：常规与 ST 均为 ±20% -> [8.00, 12.00]
     up_kcb, down_kcb, state_kcb = calculate_price_limits(prev_close, board="科创板")
     assert up_kcb == 12.00
     assert down_kcb == 8.00
     assert state_kcb == "BOUNDED"
+    up_kcb_st, down_kcb_st, _ = calculate_price_limits(prev_close, board="科创板", is_st=True)
+    assert up_kcb_st == 12.00
+    assert down_kcb_st == 8.00
 
-    # 5. 北交所 (BSE)：±30% -> [7.00, 13.00]
-    up_bse, down_bse, state_bse = calculate_price_limits(prev_close, board="BSE")
-    assert up_bse == 13.00
-    assert down_bse == 7.00
-    assert state_bse == "BOUNDED"
+    # 5. 北交所 (BSE)：仅上市首日无涨跌幅，次日起恢复 ±30%
+    up_bse_d1, _, state_bse_d1 = calculate_price_limits(prev_close, board="BSE", days_since_ipo=1)
+    assert state_bse_d1 == "UNBOUNDED"
+    up_bse_d2, down_bse_d2, state_bse_d2 = calculate_price_limits(prev_close, board="BSE", days_since_ipo=2)
+    assert state_bse_d2 == "BOUNDED"
+    assert up_bse_d2 == 13.00
+    assert down_bse_d2 == 7.00
 
-    # 6. 新股上市前 5 个交易日：无涨跌幅限制
+    # 6. 主板/双创前 5 日无限制
     up_ipo, down_ipo, state_ipo = calculate_price_limits(prev_close, board="MAIN", days_since_ipo=3)
     assert up_ipo is None
     assert down_ipo is None
@@ -86,10 +99,12 @@ def test_item1_board_differentiated_price_limits():
     assert down_delist is None
     assert state_delist == "UNBOUNDED"
 
-    # 8. 4舍5入到分精度检验 (如 prev_close = 10.35)
+    # 8. 未知板块必须显式拒绝，绝不静默回退
+    with pytest.raises(ValueError, match="Unknown trading board"):
+        calculate_price_limits(prev_close, board="INVALID_BOARD")
+
+    # 9. 4舍5入到分精度检验 (如 prev_close = 10.35)
     up_frac, down_frac, _ = calculate_price_limits(10.35, board="MAIN")
-    # 10.35 * 1.10 = 11.385 -> 11.39
-    # 10.35 * 0.90 = 9.315 -> 9.32 (或 9.31)
     assert up_frac == 11.39
     assert down_frac in (9.31, 9.32)
 
@@ -189,19 +204,22 @@ def test_item3_suspension_and_no_data_handling():
 # 【Item 4】退市持仓处理 (30天无行情清算/计提)
 # ==============================================================================
 def test_item4_delisting_liquidation_and_haircut():
-    """验证持仓标的长期无行情/退市时的强制清算处理"""
+    """验证持仓标的长期无行情时的折价计提与财务真实性 (不凭空变现)"""
     # 正常持仓 20 天无行情 -> 继续持有观察
     res_normal = handle_delisting_valuation(held_shares=1000, last_price=10.0, days_no_quote=20)
     assert res_normal["action"] == "HOLD"
+    assert res_normal["is_cash_realized"] is False
+    assert res_normal["assessed_market_value"] == 10000.00
 
-    # 超过 30 交易日无行情 -> 触发强制残值清算 (折价 50%)
-    res_liquidate = handle_delisting_valuation(
+    # 超过 30 交易日无行情 -> 触发资产折价准备 (折价 50%)
+    res_haircut = handle_delisting_valuation(
         held_shares=1000, last_price=10.0, days_no_quote=35, forced_liquidation_days=30, haircut=0.50
     )
-    assert res_liquidate["action"] == "FORCE_LIQUIDATE"
-    # 1000 股 * 10 元 * (1 - 0.5) = 5000.00 元回收现金
-    assert res_liquidate["cash_recovered"] == 5000.00
-    assert res_liquidate["haircut_applied"] == 0.50
+    assert res_haircut["action"] == "HAIRCUT_VALUATION"
+    assert res_haircut["assessed_market_value"] == 5000.00
+    assert res_haircut["valuation_loss"] == 5000.00
+    assert res_haircut["haircut_applied"] == 0.50
+    assert res_haircut["is_cash_realized"] is False
 
 
 # ==============================================================================
@@ -249,12 +267,12 @@ def test_item6_statutory_fee_model():
     )
     inst_id = InstrumentId(Symbol("600519"), Venue("SSE"))
 
-    def make_order(side: OrderSide) -> MarketOrder:
+    def make_order(side: OrderSide, cid: str = "O-1") -> MarketOrder:
         return MarketOrder(
             trader_id=TraderId("TRADER-001"),
             strategy_id=StrategyId("STRATEGY-001"),
             instrument_id=inst_id,
-            client_order_id=ClientOrderId("O-1"),
+            client_order_id=ClientOrderId(cid),
             order_side=side,
             quantity=Quantity.from_int(100),
             time_in_force=TimeInForce.GTC,
@@ -265,14 +283,14 @@ def test_item6_statutory_fee_model():
     # 1. 小额买入 (100 股 @ 10 元 = 1000 元)
     # 佣金 0.3 元 < 5 元，触发 5 元保底；过户费 0.01 元；印花税 0 元 -> 总计 5.01 元
     fee_buy_small = model.get_commission(
-        make_order(OrderSide.BUY), Quantity.from_int(100), Price.from_str("10.00")
+        make_order(OrderSide.BUY, cid="O-BUY"), Quantity.from_int(100), Price.from_str("10.00")
     )
     assert fee_buy_small.as_double() == 5.01
 
     # 2. 大额卖出 (1000 股 @ 100 元 = 100,000 元)
     # 佣金 30 元 (> 5 元)；过户费 1 元；卖方印花税 50 元 -> 总计 81.00 元
     fee_sell_large = model.get_commission(
-        make_order(OrderSide.SELL), Quantity.from_int(1000), Price.from_str("100.00")
+        make_order(OrderSide.SELL, cid="O-SELL"), Quantity.from_int(1000), Price.from_str("100.00")
     )
     assert fee_sell_large.as_double() == 81.00
 

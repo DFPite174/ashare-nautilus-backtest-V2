@@ -84,3 +84,42 @@ def test_golden_ledger_t1_violation_on_same_day():
     ledger.apply_fill(fill_sell, "2025-05-07")
     assert ledger.positions["600519.SH"] == Decimal("500.0")
     assert ledger.tradable_positions["600519.SH"] == Decimal("500.0")
+
+
+def test_golden_ledger_idempotency_and_atomicity():
+    """验证成交幂等去重与校验失败时的原子性事务控制"""
+    ledger = GoldenLedger(initial_cash=Decimal("100000.0"))
+    ledger.on_trade_day_start("2025-05-06")
+
+    fill = Fill(
+        fill_id="f100",
+        symbol="600519.SH",
+        side=OrderSide.BUY,
+        quantity=Decimal("100.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("5.0"),
+        timestamp=datetime(2025, 5, 6, 10, 0, 0),
+    )
+    ledger.apply_fill(fill, "2025-05-06")
+
+    # 1. 幂等去重：重复应用同一 fill_id 必须抛出异常
+    with pytest.raises(ValueError, match="Duplicate fill detected"):
+        ledger.apply_fill(fill, "2025-05-06")
+
+    # 2. 原子性：资金不足失败的 fill 绝不能污染 ledger.fills 列表
+    initial_fills_len = len(ledger.fills)
+    huge_fill = Fill(
+        fill_id="f101",
+        symbol="600519.SH",
+        side=OrderSide.BUY,
+        quantity=Decimal("1000000.0"),
+        price=Decimal("100.0"),
+        fee=Decimal("50.0"),
+        timestamp=datetime(2025, 5, 6, 11, 0, 0),
+    )
+    with pytest.raises(ValueError, match="Ledger cash deficit"):
+        ledger.apply_fill(huge_fill, "2025-05-06")
+
+    # 失败后，fills 记录数保持不变
+    assert len(ledger.fills) == initial_fills_len
+    assert "f101" not in ledger.processed_fill_ids

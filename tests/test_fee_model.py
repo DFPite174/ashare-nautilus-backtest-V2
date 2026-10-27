@@ -50,3 +50,23 @@ def test_sell_stamp_duty_applied():
     # 总费用 = 81.0 元
     fee = model.get_fee(order, Price.from_str("100.0"), Quantity.from_int(1000))
     assert fee.as_double() == 81.00
+
+
+def test_partial_fills_no_duplicate_min_commission():
+    """验证母订单分两笔成交时，不重复收取最低 5 元佣金"""
+    model = AShareFeeModel(commission_rate=0.0003, min_commission=5.0)
+    order = create_dummy_order(OrderSide.BUY)
+
+    # 第一笔成交：50 股 @ 10.0 元 = 500 元
+    # 佣金 = 5.0 元（保底），过户费 = 0.005 元 -> 四舍五入后 5.01 元
+    fee_1 = model.get_fee(order, Price.from_str("10.0"), Quantity.from_int(50))
+    assert fee_1.as_double() == 5.01
+
+    # 第二笔成交：50 股 @ 10.0 元 = 500 元
+    # 母订单累计成交额 1000 元，理论累计佣金 0.3 元 <= 5.0 元，因此第二笔增量佣金为 0.0 元！
+    # 仅收取第二笔过户费 0.005 -> 0.01 元
+    fee_2 = model.get_fee(order, Price.from_str("10.0"), Quantity.from_int(50))
+    assert fee_2.as_double() == 0.01
+
+    # 两笔合计收费 5.02 元 (5元佣金 + 0.01元双边过户费舍入)，杜绝重复扣除 5 元保底
+    assert round(fee_1.as_double() + fee_2.as_double(), 2) == 5.02
