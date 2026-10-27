@@ -70,3 +70,51 @@ def test_partial_fills_no_duplicate_min_commission():
 
     # 两笔合计收费 5.02 元 (5元佣金 + 0.01元双边过户费舍入)，杜绝重复扣除 5 元保底
     assert round(fee_1.as_double() + fee_2.as_double(), 2) == 5.02
+
+
+def test_fee_model_scope_and_strategy_isolation():
+    """
+    【R07 费用累计缓存隔离与多维命名空间】
+    验证即使两个独立的测试运行或策略产生完全相同的 ClientOrderId ('O-1')，
+    在不同作用域/策略/交易员命名空间下，各自均正确独立计收最低 5 元保底佣金。
+    """
+    from engine.fee_model import calculate_expected_fee, get_ashare_rates_for_date
+
+    model = AShareFeeModel(commission_rate=0.0003, min_commission=5.0, scope_id="run_1")
+    order_run1 = create_dummy_order(OrderSide.BUY)  # ClientOrderId("O-1")
+
+    # Run 1 首笔买入: 100 股 @ 10.0 -> 5.01 元
+    fee_1 = model.get_fee(order_run1, Price.from_str("10.0"), Quantity.from_int(100))
+    assert fee_1.as_double() == 5.01
+
+    # 切换到 Run 2 作用域，使用同样 ID 的订单对象
+    model.set_scope("run_2")
+    order_run2 = create_dummy_order(OrderSide.BUY)  # ClientOrderId("O-1")
+
+    # Run 2 首笔买入: 必须重新计收最低 5 元保底佣金 (5.01 元)，绝不能被 Run 1 缓存污染成 0.01 元！
+    fee_2 = model.get_fee(order_run2, Price.from_str("10.0"), Quantity.from_int(100))
+    assert fee_2.as_double() == 5.01
+
+
+def test_historical_fee_rates_and_oracle():
+    """
+    【R07 历史分水岭费率与独立 Oracle 验证】
+    """
+    from engine.fee_model import calculate_expected_fee, get_ashare_rates_for_date
+
+    # 2023-08-28 之前：印花税千分之一 (0.001)
+    rates_old = get_ashare_rates_for_date("2023-05-01")
+    assert rates_old["stamp_duty_rate"] == Decimal("0.0010")
+
+    # 2023-08-28 之后：印花税万分之五 (0.0005)
+    rates_new = get_ashare_rates_for_date("2024-01-01")
+    assert rates_new["stamp_duty_rate"] == Decimal("0.0005")
+
+    # Oracle 独立算例：1000 股 @ 100 元 = 100,000 元卖出
+    # 旧印花税: 佣金 30 + 过户费 1 + 印花税 100 = 131.00
+    fee_old = calculate_expected_fee("SELL", Decimal("1000"), Decimal("100"), trade_date="2023-05-01")
+    assert fee_old == Decimal("131.00")
+
+    # 新印花税: 佣金 30 + 过户费 1 + 印花税 50 = 81.00
+    fee_new = calculate_expected_fee("SELL", Decimal("1000"), Decimal("100"), trade_date="2024-01-01")
+    assert fee_new == Decimal("81.00")

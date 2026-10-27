@@ -48,14 +48,19 @@ def test_item1_board_differentiated_price_limits():
     assert down == 9.00
     assert state == "BOUNDED"
 
-    # 2. 主板 ST / *ST 风险警示标的：±5% -> [9.50, 10.50]
+    # 2. 主板 ST / *ST 风险警示标的：2026-07-06 前为 ±5% -> [9.50, 10.50]
     up_st, down_st, state_st = calculate_price_limits(prev_close, board="MAIN", is_st=True)
     assert up_st == 10.50
     assert down_st == 9.50
     assert state_st == "BOUNDED"
 
-    # 2.1 主板 ST 在 2026-07 规则调整后：实施 ±10% 涨跌幅
-    up_st_2026, down_st_2026, _ = calculate_price_limits(prev_close, board="MAIN", is_st=True, rule_date="2026-07-02")
+    # 2.1 主板 ST 在 2026-07-03 (生效日前最后一个交易日)：仍维持 ±5%
+    up_st_pre, down_st_pre, _ = calculate_price_limits(prev_close, board="MAIN", is_st=True, rule_date="2026-07-03")
+    assert up_st_pre == 10.50
+    assert down_st_pre == 9.50
+
+    # 2.2 主板 ST 自 2026-07-06 起正式施行新规：调整为 ±10%
+    up_st_2026, down_st_2026, _ = calculate_price_limits(prev_close, board="MAIN", is_st=True, rule_date="2026-07-06")
     assert up_st_2026 == 11.00
     assert down_st_2026 == 9.00
 
@@ -198,6 +203,11 @@ def test_item3_suspension_and_no_data_handling():
     }
     bar_zero_volume = {"close": 10.0, "volume": 0}
     assert block_reason(open_rule, bar_zero_volume, "buy") == "ZERO_VOLUME"
+
+    # 3. 缺失规则或未知状态 (R04 有疑必阻防护，绝不缺数据即放行)
+    assert block_reason({}, bar_normal, "buy") == "INVALID_RULE_MISSING_STATUS"
+    assert block_reason({"trade_status": "OPEN", "limit_state": "TYPO"}, bar_normal, "buy") == "INVALID_LIMIT_STATE"
+    assert block_reason({"trade_status": "OPEN", "limit_state": "UNAVAILABLE"}, bar_normal, "buy") == "PRICE_BAND_UNAVAILABLE"
 
 
 # ==============================================================================

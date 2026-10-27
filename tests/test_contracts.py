@@ -59,6 +59,34 @@ def test_target_weights_validation():
     )
     assert sum(tw.weights.values()) <= 1.0
 
+    # 1. 内层字典被深冻结，禁止原地篡改 (R06)
+    with pytest.raises(TypeError):
+        tw.weights["600519.SH"] = 2.0  # type: ignore
+
+    # 2. 拒绝 NaN 与非法权重
+    with pytest.raises(ValidationError):
+        TargetWeights(
+            signal_date=date(2025, 5, 5),
+            execution_date=date(2025, 5, 6),
+            weights={"600519.SH": float("nan")},
+        )
+
+    # 3. 拒绝总和超过 1.0
+    with pytest.raises(ValidationError):
+        TargetWeights(
+            signal_date=date(2025, 5, 5),
+            execution_date=date(2025, 5, 6),
+            weights={"600519.SH": 0.8, "000001.SZ": 0.5},
+        )
+
+    # 4. 拒绝执行日期早于信号日期
+    with pytest.raises(ValidationError):
+        TargetWeights(
+            signal_date=date(2025, 5, 6),
+            execution_date=date(2025, 5, 5),
+            weights={"600519.SH": 0.5},
+        )
+
 
 def test_execution_assumptions_defaults():
     assump = ExecutionAssumptions()

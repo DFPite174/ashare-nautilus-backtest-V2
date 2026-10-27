@@ -96,7 +96,8 @@ def calculate_price_limits(
         pct = 0.30
     elif is_main:
         if is_st:
-            if rule_date and rule_date >= "2026-07-01":
+            # 2026年4月上交所/深交所发布通知：主板风险警示股票自 2026年7月6日起实施 ±10% 涨跌幅
+            if rule_date and rule_date >= "2026-07-06":
                 pct = 0.10
             else:
                 pct = 0.05
@@ -196,26 +197,37 @@ def block_reason(
     execution_price: Optional[float] = None
 ) -> Optional[str]:
     """
-    判断指定挂单是否受 A 股规则限制而被拦截阻断
+    判断指定挂单是否受 A 股规则限制而被拦截阻断 (有疑必阻，Fail-Safe 设计)
     :param rule: 当日市场规则字典
     :param bar: 当日报价 Bar
     :param side: 'buy' 或 'sell'
     :param execution_price: 预期执行价格
     :return: 阻断原因代码 (如 'LIMIT_UP_CLOSE', 'SUSPENDED')，若允许交易则返回 None
     """
+    if not rule or "trade_status" not in rule:
+        return "INVALID_RULE_MISSING_STATUS"
+
     status = rule.get("trade_status")
     if status != "OPEN":
-        return status
-    if bar.get("volume", 0) <= 0:
-        return "ZERO_VOLUME"
+        return status or "STATUS_NOT_OPEN"
 
     limit_state = rule.get("limit_state")
+    if limit_state not in ("BOUNDED", "UNBOUNDED", "UNAVAILABLE"):
+        return "INVALID_LIMIT_STATE"
+
     if limit_state == "UNAVAILABLE":
         return "PRICE_BAND_UNAVAILABLE"
 
+    if limit_state == "UNBOUNDED":
+        if bar.get("volume", 0) <= 0:
+            return "ZERO_VOLUME"
+        return None
+
     if limit_state == "BOUNDED":
+        if bar.get("volume", 0) <= 0:
+            return "ZERO_VOLUME"
         lo, hi = rule.get("down_limit"), rule.get("up_limit")
-        if lo is None or hi is None:
+        if lo is None or hi is None or lo <= 0 or hi <= lo:
             return "PRICE_BAND_UNAVAILABLE"
         close_p = bar.get("close", 0.0)
         # 日线收盘执行：保守策略在涨停日拒绝买单，跌停日拒绝卖单

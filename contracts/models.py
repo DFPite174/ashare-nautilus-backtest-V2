@@ -108,11 +108,19 @@ class TargetWeights(BaseModel):
 
     @model_validator(mode="after")
     def validate_target_weights(self) -> "TargetWeights":
+        import math
         if self.execution_date < self.signal_date:
             raise ValueError(f"execution_date ({self.execution_date}) cannot precede signal_date ({self.signal_date})")
+        for sym, w in self.weights.items():
+            if not isinstance(w, (int, float)) or not math.isfinite(w):
+                raise ValueError(f"Weight for {sym} must be a finite number, got {w}")
+            if w < 0.0 or w > 1.0:
+                raise ValueError(f"Weight for {sym} must be between 0.0 and 1.0, got {w}")
         total_w = sum(self.weights.values())
         if total_w > 1.000001:
             raise ValueError(f"Total target weights sum to {total_w:.4f}, exceeding 1.0 limit")
+        # 深冻结字典，防止通过内层字典直接篡改数据 (R06)
+        object.__setattr__(self, "weights", MappingProxyType(dict(self.weights)))
         return self
 
 
