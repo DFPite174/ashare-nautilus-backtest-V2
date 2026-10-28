@@ -103,6 +103,19 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
             raise ValueError("Only Shanghai/Shenzhen cash equities are supported")
         if i.currency!='CNY' or i.tick_size!=D('.01') or i.lot_size<=0:
             raise ValueError('CNY equities with 0.01 price tick and positive lot size required')
+        if i.list_date and i.delist_date and i.list_date>i.delist_date:
+            raise ValueError(f'Invalid security lifecycle: {i.symbol}')
+    # Validate before astimezone or sorting can assume a timezone implicitly.
+    for b in bars:
+        if b.symbol not in master:
+            raise ValueError(f'Unknown bar symbol: {b.symbol}')
+        for field in ('start','end'):
+            value=getattr(b,field)
+            if not isinstance(value,datetime) or value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f'Explicit timezone required: {b.symbol} {field}')
+        inst=master[b.symbol];day=b.end.astimezone(TZ).date()
+        if (inst.list_date and day<inst.list_date) or (inst.delist_date and day>inst.delist_date):
+            raise ValueError(f'Bar outside security lifecycle: {b.symbol} {day}')
     bar_days={b.end.astimezone(TZ).date() for b in bars}
     first,last=min(bar_days),max(bar_days)
     sessions = sorted(set(trading_days) if trading_days is not None else {d for s,d in rules if s in master and first<=d<=last} | bar_days)
@@ -110,8 +123,11 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
     for day in sessions:
         if day.weekday() >= 5: raise ValueError("Invalid exchange session date")
         for symbol, inst in master.items():
-            if inst.list_date and day < inst.list_date: continue
             r = rules.get((symbol,day))
+            if (inst.list_date and day<inst.list_date) or (inst.delist_date and day>inst.delist_date):
+                if isinstance(r,dict) and r.get('trade_status')=='OPEN':
+                    raise ValueError(f'OPEN rule outside security lifecycle: {symbol} {day}')
+                continue
             if not isinstance(r,dict): raise ValueError(f"Missing daily rule: {symbol} {day}")
             if r.get('trade_status') not in {'OPEN','SUSPENDED','DAY_BLOCKED'}:
                 raise ValueError(f"Invalid daily rule status: {symbol} {day}")
@@ -126,8 +142,6 @@ def _validate(instruments, bars, rules, actions, initial_cash, rate, trading_day
                 raise ValueError("Missing executable price band rule")
     previous={}; actual=set()
     for b in sorted(bars,key=lambda x:(x.start,x.symbol)):
-        if b.symbol not in master or b.start.tzinfo is None or b.end.tzinfo is None:
-            raise ValueError("Known symbol and explicit timezone required")
         start,end=b.start.astimezone(TZ),b.end.astimezone(TZ)
         if start.date()!=end.date() or not at(start.date(),9,30)<=start<end<=at(start.date(),15):
             raise ValueError("Bar is outside the supported session")
@@ -396,4 +410,9 @@ def run_backtest(instruments, bars, rules, signal, *, corporate_actions=(), init
         if len(strategy.nav)!=len(sessions):raise RuntimeError("Missing daily reconciliation")
         native_cash=D(str(eng.portfolio.account(SIM).balance_total(CNY).as_double()))
         return BacktestResult(native_cash,strategy.ledger.cash,{s:strategy.ledger.positions.get(s,D(0)) for s in master},strategy.fills,strategy.rejections,strategy.nav,list(cash_module.journal),[{'id':str(o.client_order_id),'status':o.status.name,'quantity':str(o.quantity),'filled_quantity':str(o.filled_qty)} for o in eng.cache.orders()],[{'symbol':i.symbol,'side':i.side,'quantity':i.quantity,'reason':'END_OF_DATA'} for _,i in strategy.pending])
-    finally:eng.dispose()
+    finally:
+        try:
+            # Kernel disposal stops other engines, but not a still-running trader.
+            # Do not end() a failed run: it flushes future timers and callbacks.
+            if eng.trader.is_running:eng.trader.stop()
+        finally:eng.dispose()
