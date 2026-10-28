@@ -1,4 +1,4 @@
-# ashare-nautilus-backtest-V2：沪深常规策略回测
+# ashare-nautilus-backtest-engine：沪深常规策略回测
 
 当前实现面向沪深普通股票、现金多头、多日持有、日线/分钟线研究。公共入口 `engine.run_backtest` 使用官方 NautilusTrader 1.231.0 的 BacktestEngine、原生订单/撮合/账户/持仓，Python 层负责交易规则、生命周期与独立参考账本。
 

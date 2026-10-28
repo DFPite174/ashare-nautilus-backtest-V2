@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ashare-nautilus-backtest-v2"
+name = "ashare-nautilus-backtest-engine"
 version = "2.0.0"
-description = "Enterprise A-share Event-Driven Backtesting Adaptation for NautilusTrader V2"
+description = "A-share account-level backtest engine based on NautilusTrader"
 readme = "README.md"
 authors = [{ name = "Changlong Xie" }]
 requires-python = ">=3.12"
