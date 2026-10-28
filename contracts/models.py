@@ -112,7 +112,7 @@ class Bar(BaseModel):
 
 class CorporateAction(BaseModel):
     """公司行为模型 (分红、送股、转增、拆细)"""
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra='forbid')
 
     symbol: str
     ex_date: date = Field(..., description="除权除息日")
