@@ -478,7 +478,7 @@ def test_gtc_cross_day_order_rejected_by_gateway():
         price=Price.from_str("99.00"),
         time_in_force=TimeInForce.GTC,  # 非法跨日有效期
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100}
     bar = {"close": 100.0, "volume": 1000}
@@ -521,7 +521,7 @@ def test_concurrent_sell_orders_reservation_rejected():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-07 10:00:00"),
     )
     res_1 = gateway.validate_and_reserve(order_1, rule, bar, benchmark_price=100.0)
     assert res_1.is_valid, "第一笔合规卖单应通过校验"
@@ -538,7 +538,7 @@ def test_concurrent_sell_orders_reservation_rejected():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-07 10:00:00"),
     )
     res_2 = gateway.validate_and_reserve(order_2, rule, bar, benchmark_price=100.0)
     assert not res_2.is_valid, "超额重复卖单必须被拦截"
@@ -609,7 +609,7 @@ def test_gateway_input_validation_boundary_matrix():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     res_1 = gateway.validate_and_reserve(order_huge, base_rule, normal_bar, benchmark_price=100.0)
     assert not res_1.is_valid
@@ -626,7 +626,7 @@ def test_gateway_input_validation_boundary_matrix():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     res_2 = gateway.validate_and_reserve(order_normal, base_rule, normal_bar, benchmark_price=None)
     assert not res_2.is_valid
@@ -677,7 +677,7 @@ def test_gateway_idempotency_and_deduplication():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     # 首次提交: 合法
     res_1 = gateway.validate_and_reserve(order, base_rule, bar, benchmark_price=100.0)
@@ -774,7 +774,7 @@ def test_native_order_cancellation_releases_reserved_inventory():
         time_in_force=TimeInForce.DAY,
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 130.0, "down_limit": 90.0, "sell_min": 100, "sell_step": 100}
-    bar = {"close": 100.0, "volume": 1000.0}
+    bar = {"close": 100.0, "volume": 1000.0, "execution_ts": beijing_to_utc_ns("2025-05-07 10:00:00")}
     res = strat.gateway.validate_and_reserve(order, rule, bar, benchmark_price=100.0)
     assert res.is_valid
     assert strat.gateway.get_sellable_qty("600519") == Decimal("0.0")
@@ -809,7 +809,7 @@ def test_day_order_fill_on_new_day_cannot_be_sold_same_day():
     gateway.on_trade_day_start("2025-05-06")
     assert gateway.get_sellable_qty("600519") == Decimal("0.0")
 
-    # 模拟 5 月 7 日上午 09:30 提交并成交一笔 200 股买单 (时戳为 5 月 7 日)
+    # 前一日登记的订单收到新日异常/恢复回报；回报日期仍必须保持新买冻结。
     buy_order = LimitOrder(
         trader_id=TraderId("TRADER-001"),
         strategy_id=StrategyId("STRATEGY-001"),
@@ -820,7 +820,7 @@ def test_day_order_fill_on_new_day_cannot_be_sold_same_day():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule_d2 = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100}
     bar_d2 = {"close": 100.0, "volume": 1000.0}
@@ -857,7 +857,7 @@ def test_day_order_fill_on_new_day_cannot_be_sold_same_day():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-07 10:00:00"),
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "sell_min": 100, "sell_step": 100}
     bar = {"close": 100.0, "volume": 1000.0}
@@ -898,7 +898,7 @@ def test_unbounded_limit_state_enforces_price_collar():
         price=Price.from_str("103.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule_unbounded = {
         "trade_status": "OPEN",
@@ -932,7 +932,7 @@ def test_unbounded_limit_state_enforces_price_collar():
         price=Price.from_str("101.50"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     res_good = gateway.validate_and_reserve(good_buy_order, rule_unbounded, bar, benchmark_price=100.0)
     assert res_good.is_valid
@@ -962,7 +962,7 @@ def test_gateway_and_strategy_order_denied_callback_releases_reservation():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "sell_min": 100, "sell_step": 100}
     bar = {"close": 100.0, "volume": 1000.0}
@@ -1019,7 +1019,7 @@ def test_gateway_rejects_untracked_and_overfilled_orders():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100}
     bar = {"close": 100.0, "volume": 1000.0}
@@ -1158,7 +1158,7 @@ def test_closing_auction_phase_bypasses_price_collar():
         price=Price.from_str("109.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     bar_dict = {"close": 100.0, "volume": 10000}
 
@@ -1186,6 +1186,7 @@ def test_closing_auction_phase_bypasses_price_collar():
         "buy_min": 100,
         "buy_step": 100,
     }
+    bar_dict["execution_ts"] = beijing_to_utc_ns("2025-05-06 14:58:00")
     res_auc = gateway.validate_and_reserve(order, auction_rule, bar_dict, benchmark_price=100.0)
     assert res_auc.is_valid, f"Closing auction should bypass 2% collar, but got: {res_auc.rejection_reason}"
 
@@ -1215,7 +1216,7 @@ def test_gateway_atomic_deduplication_and_identity_validation():
         price=Price.from_str("100.00"),
         time_in_force=TimeInForce.DAY,
         init_id=UUID4(),
-        ts_init=0,
+        ts_init=beijing_to_utc_ns("2025-05-06 10:00:00"),
     )
     rule = {"trade_status": "OPEN", "limit_state": "BOUNDED", "up_limit": 110.0, "down_limit": 90.0, "buy_min": 100, "buy_step": 100}
     bar = {"close": 100.0, "volume": 1000}
@@ -1232,7 +1233,7 @@ def test_gateway_atomic_deduplication_and_identity_validation():
         commission = Money(0.0, CNY)
         ts_event = beijing_to_utc_ns("2025-05-06 10:00:00")
 
-    with pytest.raises(RuntimeError, match="Instrument symbol mismatch"):
+    with pytest.raises(RuntimeError, match="Instrument identity mismatch"):
         gateway.on_order_filled(MismatchInstFillEvent())
 
     # 2. 买卖方向不匹配 (申报 BUY，回报 SELL)

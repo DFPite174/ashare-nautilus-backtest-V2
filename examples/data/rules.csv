@@ -1,0 +1,4 @@
+symbol,trade_date,trade_status,limit_state,up_limit,down_limit,buy_min,buy_step,sell_min,sell_step,max_order
+600519.SH,20250506,OPEN,BOUNDED,11,9,100,100,100,100,1000000
+600519.SH,20250507,OPEN,BOUNDED,11,9,100,100,100,100,1000000
+600519.SH,20250508,OPEN,BOUNDED,11.55,9.45,100,100,100,100,1000000

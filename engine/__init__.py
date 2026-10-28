@@ -19,6 +19,7 @@ from engine.fee_model import (
 )
 from engine.golden_ledger import GoldenLedger
 from engine.order_gateway import AShareOrderGateway, OrderValidationResult
+from engine.backtest import BacktestBar, OrderIntent, BacktestResult, run_backtest
 
 __all__ = [
     "DailyMarketRule",
@@ -34,4 +35,5 @@ __all__ = [
     "GoldenLedger",
     "AShareOrderGateway",
     "OrderValidationResult",
+    "BacktestBar", "OrderIntent", "BacktestResult", "run_backtest",
 ]

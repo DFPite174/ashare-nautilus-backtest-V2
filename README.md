@@ -1,120 +1,88 @@
-# ashare-nautilus-backtest-V2
+# ashare-nautilus-backtest-V2：沪深常规策略回测
 
-> **面向企业级量化投研团队的 NautilusTrader A 股高保真事件驱动回测适配底座**  
-> 深度对接 NautilusTrader 事件驱动框架，提供中国 A 股全套法定与微观市场交易规则：T+1 状态机流转、前置订单风控网关、挂单库存原子预留、动态多板块涨跌幅（含 2026 年主板 ST 改革制度）、注册制 2% 申报价格笼子、整手与零股清仓规则、法定费税（订单级最低 5 元佣金 / 印花税 / 过户费）、不可变研究契约（Pydantic v2）、Cython 原生拆股支持、以及独立参考黄金账本（Golden Ledger）双轨零漂移核验。
+当前实现面向沪深普通股票、现金多头、多日持有、日线/分钟线研究。公共入口 `engine.run_backtest` 使用官方 NautilusTrader 1.231.0 的 BacktestEngine、原生订单/撮合/账户/持仓，Python 层负责交易规则、生命周期与独立参考账本。
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
-[![NautilusTrader 1.231.0](https://img.shields.io/badge/NautilusTrader-1.231.0-brightgreen.svg)](https://nautilustrader.io/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-57%20passed-brightgreen.svg)]()
+这不是纯 Rust 主程序；官方 Python 包的执行路径含 Cython 与 Rust 组件。本阶段不包含实盘接入。
 
----
+## 安装与运行
 
-## 一、 系统架构图
+本次实际验证环境：Windows x64、Python 3.12、NautilusTrader 1.231.0。公司行为送转使用仓库已有的固定 ABI Cython `.pyd`；`split_guard.py` 校验二进制和依赖指纹，跨平台或版本漂移会明确失败。
 
-本项目基于 NautilusTrader 1.231.0 架构，由 Python/Cython 回测撮合引擎、Cython 原生加速扩展、Python A 股制度与风控适配层、以及独立参考黄金账本共同构成：
+在仓库根目录执行：
 
-```text
-       ┌────────────────────────────────────────────────────────┐
-       │              Research Contracts (Pydantic v2)          │
-       │    Instrument | Bar | TargetWeights | CorporateAction  │
-       └───────────────────────────┬────────────────────────────┘
-                                   │
-       ┌───────────────────────────┴────────────────────────────┐
-       │             ashare-nautilus-backtest-V2 Core           │
-       │                                                        │
-       │  ┌───────────────────────┐   ┌───────────────────────┐ │
-       │  │ Pre-Trade Gateway     │   │ Statutory Fee Model   │ │
-       │  │ (Collar/Limits/T+1)   │   │ (Min 5 CNY/Stamp/Xfer)│ │
-       │  └───────────────────────┘   └───────────────────────┘ │
-       │  ┌───────────────────────┐   ┌───────────────────────┐ │
-       │  │ Split/Dividend Native │   │ Independent Golden    │ │
-       │  │ (Cython Bridge .pyd)  │   │ Accounting Ledger     │ │
-       │  └───────────────────────┘   └───────────────────────┘ │
-       └───────────────────────────┬────────────────────────────┘
-                                   │ (Direct Callback / AddVenue)
-                                   ▼
-       ┌────────────────────────────────────────────────────────┐
-       │               NautilusTrader 1.231.0 Engine            │
-       │    BacktestEngine | OrderMatchingEngine | Portfolio    │
-       │       (Cython Execution Engine with Rust Core)         │
-       └────────────────────────────────────────────────────────┘
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest tests -q
+python examples/regular_backtest.py --bars examples/data/bars_daily.csv --rules examples/data/rules.csv --output daily-result.json
+python examples/regular_backtest.py --bars examples/data/bars_minute.csv --frequency MINUTE --rules examples/data/rules.csv --output minute-result.json
 ```
 
----
+示例是三天合成行情，仅用于工程验收。分钟样例每天只有一根 Bar，不代表全天覆盖。实际研究必须自行核验分钟数据完整性及供应商时间戳约定。
 
-## 二、 A 股特有规则与落地方位一览表 (Rule-to-File Mapping)
+## 公共接口
 
-本项目将中国 A 股特有的微观交易结构与制度规则解耦并实现在以下模块中：
+```python
+from decimal import Decimal
+from contracts import Instrument, Venue
+from engine import run_backtest, OrderIntent
+from engine.data import load_bars_csv, load_rules_csv
 
-| 规则项 | 业务定义与微观场景 | 实现文件与核心函数 | 测试断言文件 |
-| :---: | :--- | :--- | :--- |
-| **板块差异化涨跌停校验** | 沪深主板 ($\pm 10\%$)、主板 ST 标的（2026-07-06 前 $\pm 5\%$，2026-07-06 起调整为 $\pm 10\%$）、创业板/科创板 ($\pm 20\%$)、北交所（上市首日无限制，次日起 $\pm 30\%$）、主板与双创前 5 日无限制、退市整理期首日无限制、法定分位四舍五入。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`calculate_price_limits()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item1_board_differentiated_price_limits` |
-| **前置订单风控网关与挂单预留** | 申报前不可绕过的前置校验网关：检查 2% 价格笼子、整手规范、时钟有效期（强制 `TimeInForce.DAY`，拒绝跨日 GTC 挂单）；卖单申报时即时原子预留卖出份额，撤单/拒单/到期安全释放预留。 | [`engine/order_gateway.py`](file:///engine/order_gateway.py)<br>`AShareOrderGateway`<br>`validate_and_reserve()` | [`tests/test_nautilus_ashare_integration.py`](file:///tests/test_nautilus_ashare_integration.py)<br>`test_gtc_cross_day_order_rejected_by_gateway`<br>`test_concurrent_sell_orders_reservation_rejected` |
-| **T+1 可卖数量与状态流转** | 成交归属日严格依真实纳秒时戳（`Asia/Shanghai`）确定；当日买入股份锁定，跨日开盘自动释放为可卖；精准支持日内做 T（昨日持仓可高抛低吸）与超额卖出硬拦截。 | [`engine/golden_ledger.py`](file:///engine/golden_ledger.py)<br>[`engine/order_gateway.py`](file:///engine/order_gateway.py)<br>`on_trade_day_start()`<br>`apply_fill()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item2_t1_available_position_state_machine` |
-| **停牌与流动性阻断** | 标的停牌拦截申报；日内行情缺失或成交量为 0 时判定为流动性阻断（`ZERO_VOLUME`），杜绝撮合假成交。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`block_reason()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item3_suspension_and_no_data_handling` |
-| **退市长停资产减值评估** | 长期无行情（如超过 30 交易日）标的触发财务减值评估（Haircut 计提），真实反映流动性缺失风险，不虚构现金流入。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`handle_delisting_valuation()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item4_delisting_liquidation_and_haircut` |
-| **申报数量单位与零股清仓** | 主板 100 股整手买入；科创板 200 股起购 + 1 股递增；送转派息产生的零股支持一次性全量清仓卖出，非全量卖出禁止拆零。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`round_order()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item5_lot_size_and_odd_lot_rules` |
-| **法定费税与订单级累计** | 单笔母单最低 5 元券商佣金保底（部分成交不重复扣收 5 元）、卖方单边万 5 (0.05%) 印花税（支持 2023-08-28 历史减半切换）、双边十万分之一过户费；支持多维复合命名空间隔离与独立费用 Oracle。 | [`engine/fee_model.py`](file:///engine/fee_model.py)<br>`AShareFeeModel`<br>`calculate_expected_fee()` | [`tests/test_fee_model.py`](file:///tests/test_fee_model.py)<br>[`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py) |
-| **TradingState 状态联动** | 将 A 股持仓状态映射为交易状态：停牌映射为 `HALTED`，当日买入锁仓映射为 `BUY_ONLY`，已结算持仓映射为 `ACTIVE`。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`get_trading_state()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item7_trading_state_t1_coupling` |
-| **2% 申报价格笼子机制** | 注册制限价申报价格笼子：买单不得高于基准价格 102% 与基准价 +0.10 元之较大者；卖单不得低于基准价格 98% 与基准价 -0.10 元之较小者。 | [`engine/market_rules.py`](file:///engine/market_rules.py)<br>`validate_price_collar()` | [`tests/test_ashare_all_items_validation.py`](file:///tests/test_ashare_all_items_validation.py)<br>`test_item8_prev_close_and_price_collar` |
-| **公司行为与原生持仓调整** | Cython 原生扩展 `split_native` 高效调整 NautilusTrader 原生持仓与开仓均价（经济价值严格守恒）；黄金账本完整实现股权登记日权益锁定、除权除息日拆股、派现日现金到账全流程。 | [`engine/split_native.pyx`](file:///engine/split_native.pyx)<br>[`engine/golden_ledger.py`](file:///engine/golden_ledger.py) | [`tests/test_corporate_actions.py`](file:///tests/test_corporate_actions.py) |
-| **单调时序估值与逐日 NAV** | 黄金账本具备单调时间序列与价格归属时间保护，杜绝逆时估值与未来价格泄露；日终收盘自动生成 NAV 快照，核验持仓、现金与总资产双轨零漂移。 | [`engine/golden_ledger.py`](file:///engine/golden_ledger.py)<br>`mark_to_market()` | [`tests/test_golden_ledger.py`](file:///tests/test_golden_ledger.py)<br>[`tests/test_nautilus_ashare_integration.py`](file:///tests/test_nautilus_ashare_integration.py) |
+bars = load_bars_csv('bars.csv', frequency='DAY')
+rules = load_rules_csv('rules.csv')
+# 正式研究应从权威交易日历传入，包含整个回测区间内的所有交易日。
+trading_days = sorted({day for symbol, day in rules})
 
----
+def signal(bar, state):
+    # state.history 仅包含已经结束的原始 Bar；state.cash / positions / sellable 可只读访问。
+    # 在这里实现选股/择时；以下仅说明返回契约。
+    return []  # 例如 [OrderIntent(bar.symbol, 'BUY', 100)]
 
-## 三、 目录结构
-
-```text
-ashare-nautilus-backtest-V2/
-├── contracts/               # 不可变研究契约定义 (Instrument, Bar, TargetWeights 等)
-│   ├── __init__.py
-│   └── models.py
-├── engine/                  # A 股事件驱动核心适配引擎
-│   ├── __init__.py
-│   ├── market_rules.py      # [核心] 涨跌停/手数规整/价格笼子/停退市规则
-│   ├── order_gateway.py     # [核心] 前置订单风控网关与挂单库存预留
-│   ├── fee_model.py         # [核心] 法定费税模型 (最低5元/印花税/过户费/独立Oracle)
-│   ├── golden_ledger.py     # [核心] 独立参考黄金双账本 (逐日NAV/时序保护/公司行为)
-│   ├── split_guard.py       # 拆股扩展加载守卫
-│   ├── split_native.pyx     # Cython 原生拆股扩展源码
-│   └── split_native.cp312-win_amd64.pyd # Windows cp312 二进制构建
-├── tests/                   # 自动化测试套件 (57 项测试全量通过)
-│   ├── test_contracts.py                 # 研究契约深不可变与边界校验测试
-│   ├── test_fee_model.py                 # 订单级费用累计、缓存隔离与 Oracle 测试
-│   ├── test_golden_ledger.py             # 黄金账本幂等性、单调时序与公司行为测试
-│   ├── test_market_rules.py              # 市场规则引擎单元测试
-│   ├── test_corporate_actions.py         # Cython 原生拆股扩展与公司行为端到端测试
-│   ├── test_ashare_all_items_validation.py # A 股多板块交易规则专项测试
-│   └── test_nautilus_ashare_integration.py  # NautilusTrader 全生命周期端到端集成测试
-├── pyproject.toml           # 项目元数据与依赖定义
-├── requirements.txt         # 核心环境依赖
-└── README.md
+result = run_backtest(
+    [Instrument(symbol='600519.SH', exchange=Venue.SSE)],
+    bars, rules, signal,
+    initial_cash=Decimal('100000'), participation_rate=.01,
+    trading_days=trading_days, corporate_actions=[],
+)
+print(result.to_dict())
 ```
 
----
+`signal(bar,state)` 每根 Bar 结束调用一次；生成的意图最早在该证券下一根 Bar 开始时执行。多证券同一时刻按固定数据顺序依次回调，横截面策略应收齐所需证券的结束 Bar 后统一决策。没有自动目标权重优化器，数量由策略返回。
 
-## 四、 快速上手与回归测试
+- 无价格意图：观察下一 Bar 开盘价后提交该价格的原生 IOC 限价单，允许部分成交，未成交余量取消；并非交易所市价指令的完整模拟。
+- 显式 `limit_price`：原生 DAY 限价单，可在后续原生 OHLC 撮合中成交，日终统一撤单。
+- 无下一 Bar 的意图记入 `pending_intents`，原因 `END_OF_DATA`；不强制在最后收盘虚构平仓。
+- 挂单卖出数量先预留，撤单/拒单/到期释放；可卖数量受 T+1 和新增股上市日限制。
+- 沪深证券共享一个模拟 `ASHARE` 场所和一个 CNY 现金账户；真实交易所保留于证券主数据。该模拟场所不是实盘路由。
 
-### 1. 安装核心依赖
-- **Python**: `>= 3.12`
-```bash
-pip install -r requirements.txt
-```
+## 数据契约
 
-### 2. 执行全量自动化回归测试
-```bash
-pytest tests/ -v
-```
+1. **未复权 OHLC**：成交、持仓和估值使用原始价格，公司行为另行输入。不得将前/后复权行情直接送入资金回测；因子研究可独立计算复权信号。
+2. **时间**：显式时区的 `BacktestBar.start/end`，按上海时区解释交易日。日线为 09:30–15:00；分钟线须在连续交易时段内，不能跨午休或彼此重叠。
+3. **成交量**：单位为股、非负整数。Tushare 日线 `vol` 若以手计，CSV 读取时明确传 `volume_multiplier=100`；不得猜测单位。分钟接口须另核验单位与起止标签。
+4. **交易日历**：正式研究传 `trading_days`，源自交易所日历（例如已落库的 Tushare `trade_cal`）。不传时，默认使用行情首末日期内的规则日期并集；它只能发现已声明交易日的缺口，不能识别行情和规则同时漏掉的日期。
+5. **证券日规则**：`rules[(symbol, date)]` 要有 `trade_status`（OPEN/SUSPENDED/DAY_BLOCKED）、`limit_state`（BOUNDED/UNBOUNDED）以及 buy_min/buy_step/sell_min/sell_step/max_order。BOUNDED 必须提供 down_limit/up_limit；可交易 OHLC 必须落在价格边界内。规则必须使用对应历史时点的板块、ST/上市状态和官方价格边界，不能用今天的证券状态回填历史。
+6. **缺失与停牌**：每个交易日、每个已上市标的必须有规则。OPEN 缺整天 Bar 直接失败，不能当成停牌；SUSPENDED 可无 Bar。零量不成交。分钟内部缺口仍需在数据预处理阶段核验。
+7. **公司行为**：`CorporateAction` 接收登记日、除权日、派息日、新增股份上市日；现金红利必须提供登记日。每股现金红利为税前，分币 ROUND_HALF_UP；处理应收及实际到账。送转同时更新原生持仓、网关、参考账本；上市日前新增股不可卖。除权日无行情时按 `(上一估值价-每股现金红利)/(1+送转比例)` 调整估值单位。
+8. **零碎股**：公共运行器遇到账户级非整数权益时不默许丢失，要求 `reject` 或显式 `cash_in_lieu`；现金替代是研究假设，不等同于各登记结算规则的复现。`floor` 仅兼容旧独立账本接口，不适合作为普遍严格政策。
 
-**运行结果**：
-```text
-======================= 51 passed, 12 warnings in 1.34s =======================
-```
+本地 CSV 格式见 `examples/data`。规则加载器还可接收 prev_close/issue_price，供无涨跌幅阶段的申报范围检查。仓库不会联网补齐缺失规则或静默替换数据源。
 
----
+## 成交与资金约束
 
-## 五、 开源许可
+每根 Bar 的执行预算为 `floor(实际成交量 × participation_rate)`，开盘报价和后续 OHLC 撮合、所有方向和所有订单共享，成交后扣减。策略看到的仍只有已结束行情；执行模拟器可用当前 Bar 的事后成交量限制结果，这是一项 Bar 级模型假设。
 
-本项目基于 MIT 许可证开源。
-欢迎量化同行提交 Issue 与 Pull Request 共同共建高保真 A 股量化研发基础设施！
+提交数量另受上一根非零 Bar 已知成交量的参与率预算约束，防止策略从成交反馈直接获得完整未来 Bar 容量。实际当根 Bar 容量小于申报量时允许部分成交。不开启无限流动性回退。
+
+涨停买入、跌停卖出采取保守拦截；价格笼子在提交时以前开盘可得报价检查。Bar 只有 OHLCV，无法重建逐笔最优报价、队列、集合竞价成交分配、盘中临停或撤单时间细节；09:30 的开盘报价只是一项研究近似。OHLC 价格路径由 NT 原生撮合决定。
+
+当前费用模型为仓库既有的券商佣金最低额、订单累计部分成交、印花税和过户费及其已编码历史日期，不代表任意券商或任意历史时期费率。个人投资者持有期差别化股息税、融资融券、配股、要约收购和退市结算等特殊事件未纳入公共运行器；含这些事件的样本必须另行建模后才能使用其净收益。
+
+## 可核验结果
+
+结果包含真实原生成交与订单终态、规则/原生拒单、持仓、原生与参考现金、公司行为现金日志、逐日 NAV、应收红利和期末未执行意图。
+
+每日核对：原生现金=参考现金；原生持仓=网关持仓=参考持仓；原生现金+持仓估值+独立应收=参考 NAV。不相等直接报错，不生成“通过”结果。估值价格是共用输入；对账不是对原始数据真实性或市场成交真实性的证明。
+
+测试与限制详见 `docs/validation.md`。当前目标是这份明确输入契约下的常规 A 股策略资金回测，不是全市场、全资产、高频、集合竞价或实盘生产认证。
+
+买单会预留申报上限本金与预计费用，部分成交后重算，取消/拒绝/过期释放；资金不足记录 INSUFFICIENT_CASH_WITH_FEES 并继续。成交前再次按实际价与累计费用限制可支付量，以覆盖部分成交舍入差异。
