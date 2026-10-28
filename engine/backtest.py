@@ -14,7 +14,7 @@ from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick
-from nautilus_trader.model.enums import AccountType, AggregationSource, BarAggregation, OmsType, OrderSide, PriceType, TimeInForce
+from nautilus_trader.model.enums import AccountType, AggregationSource, BarAggregation, BookType, OmsType, OrderSide, PriceType, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId, Symbol, TraderId, Venue
 from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Money, Price, Quantity
@@ -26,7 +26,7 @@ from engine.fee_model import AShareFeeModel, calculate_expected_fee
 from engine.golden_ledger import GoldenLedger
 from engine.order_gateway import AShareOrderGateway
 from engine.split_guard import load_bridge
-from engine.liquidity import BarLiquidity, LiquidityModule
+from engine.liquidity import BarLiquidity, LiquidityModule, synthetic_book
 
 TZ = ZoneInfo("Asia/Shanghai")
 SIM = Venue("ASHARE")
@@ -80,7 +80,7 @@ class BacktestResult:
     account_journal: list
     orders: list
     pending_intents: list
-    execution_model: str = "next-bar-open IOC limit for unpriced intents; DAY limit with native OHLC; shared bar volume cap; no queue/auction reconstruction"
+    execution_model: str = "bar-synthetic-l2-v1: bar-derived synthetic L2 with native NT matching; next-bar-open IOC; DAY limits: open price improvement, resting limits at limit; O-H-L-C path; shared bar volume cap; inactive-session pending intents rejected; no observed L2/queue/auction reconstruction"
 
     def to_dict(self):
         from dataclasses import asdict
@@ -227,6 +227,13 @@ class _ResearchStrategy(Strategy):
         if day in self.sessions:
             self.current_day=day;self.gateway.on_trade_day_start(str(day));self.ledger.on_trade_day_start(str(day))
             self.fee_model.set_trade_date(str(day))
+            remaining=[]
+            for created,intent in self.pending:
+                status=self.rules.get((intent.symbol,day),{}).get('trade_status','DAY_BLOCKED')
+                if created<event.ts_event and status!='OPEN':
+                    self.rejections.append({'symbol':intent.symbol,'reason':status,'time':event.ts_event})
+                else:remaining.append((created,intent))
+            self.pending=remaining
         for a in self.actions:
             if a.ex_date==day:
                 ratio=D(1)+a.bonus_ratio+a.reserve_ratio
@@ -387,7 +394,7 @@ def run_backtest(instruments, bars, rules, signal, *, corporate_actions=(), init
     eng=BacktestEngine(config=BacktestEngineConfig(trader_id=TraderId('RESEARCH-001'),logging=LoggingConfig(log_level='ERROR')))
     cash_module=AShareAccountModule();fee=AShareFeeModel(scope_id='isolated_run');liquidity=BarLiquidity()
     try:
-        eng.add_venue(venue=SIM,oms_type=OmsType.NETTING,account_type=AccountType.CASH,base_currency=CNY,starting_balances=[Money(float(initial_cash),CNY)],fee_model=fee,fill_model=liquidity,liquidity_consumption=True,modules=[cash_module,LiquidityModule(liquidity)])
+        eng.add_venue(venue=SIM,oms_type=OmsType.NETTING,account_type=AccountType.CASH,base_currency=CNY,starting_balances=[Money(float(initial_cash),CNY)],fee_model=fee,fill_model=liquidity,book_type=BookType.L2_MBP,liquidity_consumption=True,modules=[cash_module,LiquidityModule(liquidity)])
         native={}
         for symbol,i in master.items():
             native[symbol]=Equity(instrument_id=InstrumentId(Symbol(symbol),SIM),raw_symbol=Symbol(symbol.split('.')[0]),currency=CNY,price_precision=2,price_increment=Price.from_str('.01'),lot_size=Quantity.from_int(i.lot_size),ts_event=nanos(at(sessions[0],0)),ts_init=nanos(at(sessions[0],0)))
@@ -397,9 +404,14 @@ def run_backtest(instruments, bars, rules, signal, *, corporate_actions=(), init
             if b.volume==0 or rules[(b.symbol,b.end.astimezone(TZ).date())]['trade_status']!='OPEN':continue
             inst=native[b.symbol];start,end=nanos(b.start),nanos(b.end)
             cap=int(D(b.volume)*D(str(participation_rate)))
-            for ts in (start+1,end):liquidity.events[(str(inst.id),ts)]=((b.symbol,end),cap)
+            iid=str(inst.id);key=(b.symbol,end)
+            for ts in (start,start+1):liquidity.events[(iid,ts)]=(key,cap,False)
+            for ts in (end-3,end-2,end-1,end):liquidity.events[(iid,ts)]=(key,cap,True)
             p=Price.from_str(format(b.open,'.2f'))
+            data.append(synthetic_book(inst,p,cap,start))
             data.append(QuoteTick(inst.id,p,p,Quantity.from_int(cap),Quantity.from_int(cap),start,start+1))
+            for ts,value in zip((end-3,end-2,end-1),(b.high,b.low,b.close)):
+                data.append(synthetic_book(inst,Price.from_str(format(value,'.2f')),cap,ts))
             daily=b.start.astimezone(TZ)==at(b.start.astimezone(TZ).date(),9,30) and b.end.astimezone(TZ)==at(b.end.astimezone(TZ).date(),15)
             spec=BarSpecification(1,BarAggregation.DAY,PriceType.LAST) if daily else BarSpecification(int((b.end-b.start).total_seconds()/60),BarAggregation.MINUTE,PriceType.LAST)
             data.append(Bar(BarType(inst.id,spec,AggregationSource.EXTERNAL),*[Price.from_str(format(v,'.2f')) for v in (b.open,b.high,b.low,b.close)],Quantity.from_int(int(D(b.volume)*D(str(participation_rate)))),end,end))
